@@ -1,0 +1,4478 @@
+/**
+ * ============================================================
+ *  BACKEND — Seguimiento Facturación Electricidad
+ *  · API + Config + Drive + OCR + Gemini (último recurso)
+ *  · Procesador masivo de PDFs (v5)
+ *  · Diagnóstico detallado en Logger
+ * ============================================================
+ */
+
+// ============================================================
+//  🔑  GEMINI API KEY — MANTENIMIENTO MANUAL
+//  Obtén la clave en https://aistudio.google.com/apikey
+//  Si se deja vacía, el sistema usa sólo el pipeline OCR.
+// ============================================================
+const GEMINI_API_KEY = 'AQ.____Ab8RN6JAjxmzYxMa2TApr4-ykoV1R6ItLH5UlFV4dDiRXFTnDw';   
+
+const GEMINI_MODEL = 'gemini-2.5-flash';
+const GEMINI_TIMEOUT = 90;
+const GEMINI_MAX_BYTES_INLINE = 20 * 1024 * 1024;
+
+// ─── Estado de cuota Drive OCR ───
+//  Cuando Drive OCR devuelve "User rate limit exceeded for OCR",
+//  guardamos una marca temporal para no seguir intentándolo en cada
+//  PDF del lote. Se reintenta automáticamente tras el reset diario.
+const PROP_KEY_DRIVE_OCR_BLOQUEADO = 'EMOAC_DRIVE_OCR_BLOQUEADO_HASTA';
+let _DRIVE_OCR_BLOQUEADO_EN_MEMORIA = false;
+
+function _driveOcrEstaBloqueado() {
+  if (_DRIVE_OCR_BLOQUEADO_EN_MEMORIA) return true;
+  try {
+    const v = PropertiesService.getScriptProperties()
+      .getProperty(PROP_KEY_DRIVE_OCR_BLOQUEADO);
+    if (!v) return false;
+    const hasta = parseInt(v, 10);
+    if (!isFinite(hasta)) return false;
+    if (Date.now() < hasta) {
+      _DRIVE_OCR_BLOQUEADO_EN_MEMORIA = true;
+      return true;
+    }
+    // Expiró → limpiar
+    PropertiesService.getScriptProperties()
+      .deleteProperty(PROP_KEY_DRIVE_OCR_BLOQUEADO);
+    return false;
+  } catch (e) { return false; }
+}
+
+function _bloquearDriveOcrPorCuota(motivo) {
+  _DRIVE_OCR_BLOQUEADO_EN_MEMORIA = true;
+  // Reintentar a las 05:00 hora local del día siguiente
+  const ahora = new Date();
+  const manana = new Date(ahora.getFullYear(), ahora.getMonth(), ahora.getDate() + 1, 5, 0, 0, 0);
+  try {
+    PropertiesService.getScriptProperties()
+      .setProperty(PROP_KEY_DRIVE_OCR_BLOQUEADO, String(manana.getTime()));
+  } catch (e) { }
+  Logger.log('⛔ Drive OCR bloqueado por cuota hasta ' + manana.toISOString() +
+    ' · motivo: ' + (motivo || 'desconocido'));
+}
+
+function _desbloquearDriveOcr() {
+  _DRIVE_OCR_BLOQUEADO_EN_MEMORIA = false;
+  try {
+    PropertiesService.getScriptProperties()
+      .deleteProperty(PROP_KEY_DRIVE_OCR_BLOQUEADO);
+  } catch (e) { }
+}
+
+const SS_ID = SpreadsheetApp.getActiveSpreadsheet().getId();
+const HOJA_RESUMEN = 'Resumen Facturación';
+const HOJA_SUMINISTRO = 'Suministro';
+const HOJA_PEAJE = 'Peaje';
+const HOJA_ARRIENDO = 'Arriendo Medidor';
+const HOJA_CONFIG = 'Config';
+const ARCHIVO_HTML = 'Frontend';
+
+// ─── Versión del manual de usuario ───
+//  Fuente única de verdad. Se inyecta en el HTML al servirlo
+//  (ver obtenerHTMLManual), así no hay que editar el HTML cuando
+//  cambie la versión.
+const MANUAL_VERSION = '20261002.227';
+
+const COL = {
+  NUMERO: 1, CODIGO: 2, CLIENTE: 3, PERIODO: 4, TIPO: 5,
+  KWH: 6, SUM: 7, PEAJE: 8, INT: 9, OTROS: 10, INT_PEAJE: 11, OTROS_PEAJE: 12, TOTAL: 13,
+  FECHA_SUMINISTRO: 14, FECHA_PEAJE: 15, FECHA_EMISION: 16, FECHA_VENC: 17,
+  PDF_ID: 18, PROCESADO_MASIVO: 19
+};
+
+const DIA_RECEPCION = 18;
+
+const PERIODOS_SEED = [
+  '2026-01', '2026-02', '2026-03', '2026-04', '2026-05', '2026-06',
+  '2026-07', '2026-08', '2026-09', '2026-10', '2026-11', '2026-12', '2027-01'
+];
+
+// ============================================================
+//  UTILIDADES DE RUT
+// ============================================================
+const RUT_EMOAC = '76208888-6';
+const RUT_ACIERTA = '77333033-6';
+
+function _normRut(r) { return String(r || '').replace(/[\.\s]/g, '').toUpperCase(); }
+function _esRutEmoac(r) { return _normRut(r) === RUT_EMOAC; }
+function _esRutAcierta(r) { return _normRut(r) === RUT_ACIERTA; }
+
+// ============================================================
+//  Detector de basura
+// ============================================================
+function _esTextoBasuraBack(txt) {
+  if (!txt) return true;
+  const s = String(txt);
+  const palabras = s.match(/[A-Za-zÁÉÍÓÚÑáéíóúñ]{3,}/g) || [];
+  if (palabras.length < 8) return true;
+  const unos = (s.match(/(?:^|\s)1(?:\s|$)/g) || []).length;
+  if (unos > 30) return true;
+  const tokens = s.split(/\s+/).filter(Boolean);
+  if (tokens.length > 50) {
+    const unosTokens = tokens.filter(t => t === '1').length;
+    if (unosTokens / tokens.length > 0.5) return true;
+  }
+  const rareza = (s.match(/[¢£¤¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿]/g) || []).length;
+  if (rareza > 15) return true;
+  return false;
+}
+
+// ============================================================
+//  Detector de "centro fantasma" (Sin asignar / TEMP)
+//  Sirve para excluirlo de las hojas de seguimiento y de
+//  cualquier listado. NO afecta los datos del Resumen.
+// ============================================================
+function _esCentroFantasmaBack(codigo, cliente) {
+  const c = String(codigo || '').trim().toUpperCase();
+  const n = String(cliente || '').trim().toUpperCase();
+  if (c === 'TEMP') return true;
+  if (c.indexOf('SIN C') === 0) return true;   // "Sin código"
+  if (n.indexOf('SIN ASIGNAR') !== -1) return true;
+  if (n.indexOf('\u26A0') !== -1) return true; // ⚠
+  return false;
+}
+
+// ============================================================
+//  UTILIDADES DE FECHA
+// ============================================================
+function _parseFechaDMY(str) {
+  if (!str) return '';
+  let mm = String(str).match(/(\d{1,2})[-\/\.](\d{1,2})[-\/\.](\d{2,4})/);
+  if (mm) {
+    const y = mm[3].length === 2 ? ('20' + mm[3]) : mm[3];
+    const d = String(parseInt(mm[1], 10)).padStart(2, '0');
+    const mo = String(parseInt(mm[2], 10)).padStart(2, '0');
+    if (+mo >= 1 && +mo <= 12 && +d >= 1 && +d <= 31) return y + '-' + mo + '-' + d;
+  }
+  mm = String(str).match(/(\d{4})[-\/\.](\d{1,2})[-\/\.](\d{1,2})/);
+  if (mm) return mm[1] + '-' + String(parseInt(mm[2], 10)).padStart(2, '0') + '-' + String(parseInt(mm[3], 10)).padStart(2, '0');
+  return '';
+}
+
+function _extraerFechaTras(txt, etiqueta, tolerante) {
+  const gap = tolerante ? 150 : 40;
+  let re = new RegExp(etiqueta + '[^\\d\\n]{0,' + gap + '}(\\d{1,2}\\s*[-\\/\\.]\\s*\\d{1,2}\\s*[-\\/\\.]\\s*\\d{2,4})', 'i');
+  let mm = txt.match(re);
+  if (mm) return mm[1];
+  re = new RegExp(etiqueta + '[\\s\\S]{0,' + gap + '}?(\\d{1,2}\\s*[-\\/\\.]\\s*\\d{1,2}\\s*[-\\/\\.]\\s*\\d{2,4})', 'i');
+  mm = txt.match(re);
+  if (mm) return mm[1];
+  const idx = txt.search(new RegExp(etiqueta, 'i'));
+  if (idx >= 0) {
+    const sub = txt.slice(idx + etiqueta.length, idx + etiqueta.length + 300);
+    const mF = sub.match(/(\d{1,2}\s*[-\/\.]\s*\d{1,2}\s*[-\/\.]\s*\d{2,4})/);
+    if (mF) return mF[1];
+  }
+  return '';
+}
+
+// ============================================================
+//  Helper numérico
+// ============================================================
+function _inputANumero(v) {
+  if (v == null) return 0;
+  if (typeof v === 'number') return isFinite(v) ? v : 0;
+  let s = String(v).trim();
+  if (!s) return 0;
+  s = s.replace(/[\$\s]/g, '');
+  if (!s) return 0;
+  if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
+  else if (s.includes('.') && /^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, '');
+  const n = Number(s);
+  return isFinite(n) ? n : 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ *  ★★★  BLOQUE DE PARSING — ÚNICO PUNTO DE MODIFICACIÓN  ★★★
+ *
+ *  Contrato de cada parser:
+ *    · Recibe texto OCR CRUDO (String).
+ *    · Devuelve objeto con:
+ *        { fDTE, fEmpresa, fNumero, fCodigo, fRut, fPeriodo,
+ *          fEmision, fVencimiento, fKwh, fSum, fPeaje, fInt,
+ *          fIntPeaje, fOtros, fOtrosPeaje, fTotal, fTipo }
+ *
+ *  Funciones:
+ *    · _detectarProveedor(t0)       → 'EMOAC' | 'ACIERTA'
+ *    · _parsearEMOACDTE(t0)         → Parser EMOAC
+ *    · _parsearAciertaDTE(t0)       → Parser Acierta
+ *    · _parsearFacturaCompleta(t0)  → Router
+ *
+ *  El vencimiento NUNCA se calcula — sólo se extrae del PDF.
+ * ═══════════════════════════════════════════════════════════════ */
+
+function _detectarProveedor(t0) {
+  const t = String(t0 || '')
+    .replace(/[–—−]/g, '-')
+    .replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, ' ');
+  if (/77\.?\s*333\.?\s*033\s*-?\s*6/.test(t)) return 'ACIERTA';
+  if (/76\.?\s*208\.?\s*888\s*-?\s*6/.test(t)
+    || /EMOAC\s*SPA|COPE?C\s*EMOAC|Copecemoac/i.test(t)) return 'EMOAC';
+  if (/\b(?:ENER|POTE|PEAJ|PASS)\.?\s*\d{2,}/i.test(t)) return 'ACIERTA';
+  return 'EMOAC';
+}
+
+// ============================================================
+//  Helper: convierte "OCHO MILLONES TRESCIENTOS DOS MIL
+//  TREINTA Y TRES Pesos chilenos" → 8302033
+// ============================================================
+function _numeroEnPalabrasAPeso(texto) {
+  if (!texto) return 0;
+  const t = String(texto).toUpperCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ').trim();
+  const m = t.match(/\bSON\s+([A-Z ]+?)\s+PESOS?\b/);
+  if (!m) return 0;
+  const palabras = m[1].split(/\s+/).filter(Boolean);
+
+  const UNI = {
+    CERO: 0, UNO: 1, UN: 1, UNA: 1, DOS: 2, TRES: 3, CUATRO: 4, CINCO: 5,
+    SEIS: 6, SIETE: 7, OCHO: 8, NUEVE: 9,
+    DIEZ: 10, ONCE: 11, DOCE: 12, TRECE: 13, CATORCE: 14, QUINCE: 15,
+    DIECISEIS: 16, DIECISIETE: 17, DIECIOCHO: 18, DIECINUEVE: 19,
+    VEINTE: 20, VEINTIUNO: 21, VEINTIUN: 21, VEINTIDOS: 22, VEINTITRES: 23,
+    VEINTICUATRO: 24, VEINTICINCO: 25, VEINTISEIS: 26, VEINTISIETE: 27,
+    VEINTIOCHO: 28, VEINTINUEVE: 29,
+    TREINTA: 30, CUARENTA: 40, CINCUENTA: 50, SESENTA: 60,
+    SETENTA: 70, OCHENTA: 80, NOVENTA: 90,
+    CIEN: 100, CIENTO: 100, DOSCIENTOS: 200, TRESCIENTOS: 300,
+    CUATROCIENTOS: 400, QUINIENTOS: 500, SEISCIENTOS: 600,
+    SETECIENTOS: 700, OCHOCIENTOS: 800, NOVECIENTOS: 900
+  };
+
+  let total = 0, actual = 0;
+  for (const p of palabras) {
+    if (p === 'MIL') {
+      actual = (actual === 0 ? 1 : actual) * 1000;
+      total += actual; actual = 0;
+    } else if (p === 'MILLON' || p === 'MILLONES') {
+      actual = (actual === 0 ? 1 : actual) * 1000000;
+      total += actual; actual = 0;
+    } else if (p === 'Y' || p === 'DE') {
+      continue;
+    } else if (p in UNI) {
+      actual += UNI[p];
+    }
+  }
+  total += actual;
+  return total;
+}
+
+// ============================================================
+//  Busca una fecha DD-MM-YYYY (formato chileno) junto a una
+//  etiqueta. Asume que el OCR siempre produce las etiquetas
+//  literales indicadas (normalizadas por NFD, sin acentos).
+// ============================================================
+// ============================================================
+//  Extrae emisión y vencimiento del encabezado.
+//  Estrategia SEMÁNTICA (no depende del orden de las etiquetas
+//  ni del layout de tabla, que puede variar en el OCR):
+//    1. Localizar la posición del primer "FECHA EMISIÓN" o
+//       "FECHA VENCIMIENTO" en el texto.
+//    2. Extraer TODAS las fechas DD-MM-YYYY en los 1500 chars
+//       siguientes.
+//    3. Desduplicar y ordenar cronológicamente.
+//       · La menor → emisión.
+//       · La mayor → vencimiento.
+//  En toda factura chilena: emisión ≤ vencimiento. Es invariante.
+// ============================================================
+function _extraerFechasEmiVen(txt) {
+  if (!txt) return { emision: '', vencimiento: '' };
+
+  const posEmi = txt.search(/FECHA\s*EMISI[OÓ0]N/i);
+  const posVen = txt.search(/FECHA\s*VENCIMIENTO/i);
+
+  // Punto de partida: el primer label que aparezca.
+  // Si ninguno aparece, arrancamos del inicio del texto.
+  let inicio = 0;
+  if (posEmi >= 0 && posVen >= 0) inicio = Math.min(posEmi, posVen);
+  else if (posEmi >= 0) inicio = posEmi;
+  else if (posVen >= 0) inicio = posVen;
+
+  const VENTANA = 1500;
+  const zona = txt.slice(inicio, inicio + VENTANA);
+
+  const RE_FECHA = /(\d{1,2})\s*[-\/\.]\s*(\d{1,2})\s*[-\/\.]\s*(\d{4})/g;
+  const encontradas = [];
+  let m;
+  while ((m = RE_FECHA.exec(zona)) !== null) {
+    const dd = parseInt(m[1], 10);
+    const mm = parseInt(m[2], 10);
+    const yy = parseInt(m[3], 10);
+    if (dd >= 1 && dd <= 31 && mm >= 1 && mm <= 12 && yy >= 2000 && yy <= 2099) {
+      encontradas.push(yy + '-' + String(mm).padStart(2, '0') + '-' + String(dd).padStart(2, '0'));
+    }
+  }
+
+  // Diagnóstico (queda en el log de Apps Script).
+  try {
+    Logger.log('[FECHAS] posEmi=' + posEmi + ' posVen=' + posVen +
+      ' zona=' + JSON.stringify(zona.slice(0, 180)) +
+      ' fechas=' + JSON.stringify(encontradas));
+  } catch (e) { }
+
+  if (!encontradas.length) return { emision: '', vencimiento: '' };
+
+  const unicas = [...new Set(encontradas)].sort();
+
+  if (unicas.length === 1) {
+    // Sólo una fecha: no podemos asegurar a qué campo pertenece.
+    // Asumimos emisión (suele ser la única que se imprime en muchos DTE).
+    return { emision: unicas[0], vencimiento: '' };
+  }
+
+  // ≥ 2 fechas: la menor es emisión, la mayor es vencimiento.
+  // Si todas las fechas son iguales (poco probable pero posible en OCR
+  // que sólo imprime una fecha repetida), dejar vencimiento vacío para
+  // no repetir el mismo valor en ambos campos.
+  if (unicas.length >= 2 && unicas[0] === unicas[unicas.length - 1]) {
+    return { emision: unicas[0], vencimiento: '' };
+  }
+  return {
+    emision: unicas[0],
+    vencimiento: unicas[unicas.length - 1]
+  };
+}
+
+function _parsearEMOACDTE(textoOriginal) {
+  const t0 = String(textoOriginal || '');
+  const out = { fDTE: true, fEmpresa: 'EMOAC' };
+
+  const tN = t0
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, ' ')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[ \t]+/g, ' ');
+
+  // ─── 1) CÓDIGO CLIENTE ───
+  let codigoCliente = '';
+  {
+    const m = tN.match(/COD\.?\s*CLIENTE\s*:?\s*([0-9][0-9Kk\.\-]{2,18})/i);
+    if (m) {
+      const v = m[1].trim().replace(/\s+/g, '').replace(/\./g, '');
+      if (v && !_esRutEmoac(v) && !/^76\d{7}/.test(v.replace(/-/g, ''))) codigoCliente = v;
+    }
+  }
+  if (!codigoCliente) {
+    const mCod = tN.match(/COD\.?\s*CLIENTE/i);
+    if (mCod) {
+      const fromCod = tN.slice(mCod.index + mCod[0].length);
+      const idxStop = fromCod.search(
+        /\b(?:PEDIDO|ORDEN|FACTURA|SUBTOTAL|TOTAL|INDICADOR|BARRA|COMUNA|BANCO|CONTACTO|DESTINATARIO|EMAIL|MES\s+DE\s+CONSUMO)\b/i
+      );
+      const ventana = idxStop >= 0 ? fromCod.slice(0, idxStop) : fromCod.slice(0, 500);
+      const reCand = /\b(\d{1,3}(?:\.\d{3}){1,3}(?:-[\dKk])?|\d{5,8}(?:-[\dKk])?)\b/g;
+      const cands = [];
+      let mm;
+      while ((mm = reCand.exec(ventana)) !== null) {
+        const raw = mm[1];
+        if (raw.indexOf('.') >= 0) continue;
+        const norm = raw.replace(/\./g, '').toUpperCase();
+        if (_esRutEmoac(norm) || _esRutAcierta(norm)) continue;
+        if (/^(19|20)\d{2}(?:-.*)?$/.test(norm)) continue;
+        cands.push(norm);
+      }
+      if (cands.length) {
+        codigoCliente = cands[cands.length - 1];
+        _logDiag('[EMOAC] Código (COD. CLIENTE → último no-RUT): ' + codigoCliente +
+          ' de [' + cands.join(', ') + ']');
+      }
+    }
+  }
+
+  // ─── 2) RUT receptor ───
+  let rutReceptor = '';
+  {
+    const mRut = tN.match(/(?:RUT\s*RECEPTOR|R\.?\s*U\.?\s*T\.?\s*(?:RECEPTOR|DEL\s*CLIENTE))\s*:?\s*([\d\.]{7,12}\s*-\s*[\dKk])/i);
+    if (mRut) {
+      const r = mRut[1].replace(/[\.\s]/g, '');
+      if (!_esRutEmoac(r)) rutReceptor = r;
+    }
+    if (!rutReceptor) {
+      const mSec = tN.match(/(?:Se[ñn]or(?:\(es\)|es)?|Cliente)[\s\S]{0,500}?/i);
+      if (mSec) {
+        const bloque = tN.slice(mSec.index, mSec.index + 500);
+        const mRut2 = bloque.match(/R\.?\s*U\.?\s*T\.?\s*:?\s*(\d{1,3}(?:\.\d{3}){2}\s*-\s*[\dKk])/i)
+          || bloque.match(/(\d{1,3}(?:\.\d{3}){2}\s*-\s*[\dKk])/);
+        if (mRut2) {
+          const r = mRut2[1].replace(/[\.\s]/g, '');
+          if (!_esRutEmoac(r)) rutReceptor = r;
+        }
+      }
+    }
+    if (!rutReceptor) {
+      const todos = [];
+      const reRut = /(\d{1,3}(?:\.\d{3}){2}\s*-\s*[\dKk])/g;
+      let mm;
+      while ((mm = reRut.exec(tN)) !== null) {
+        const r = mm[1].replace(/[\.\s]/g, '');
+        if (!_esRutEmoac(r)) todos.push(r);
+      }
+      const unicos = [...new Set(todos)];
+      if (unicos.length >= 1) rutReceptor = unicos[0];
+    }
+  }
+
+  if (codigoCliente) {
+    out.fCodigo = codigoCliente;
+    out.fRut = rutReceptor || codigoCliente;
+  } else if (rutReceptor) {
+    out.fRut = rutReceptor;
+  }
+
+  // ─── 3) N° FACTURA ───
+  //  Se acota la búsqueda al encabezado superior (antes de "S.I.I.",
+  //  "NOMBRE" o "PEDIDO") para no confundir el N° real con la
+  //  referencia del pie:
+  //    "Nota De Débito Electrónica · Corrige Montos ·
+  //     Factura Electrónica N° 49285"
+  //  Se acepta 1..12 dígitos: las "NOTA DE DÉBITO/CRÉDITO ELECTRÓNICA"
+  //  de EMOAC usan N° cortos (ej. 628); los DTE corrientes usan 5-8.
+  {
+    const idxSII    = tN.search(/S\.?\s*I\.?\s*I\.?/i);
+    const idxNombre = tN.search(/\bNOMBRE\s*:/i);
+    const idxPedido = tN.search(/\bPEDIDO\b/i);
+    let finCab = tN.length;
+    [idxSII, idxNombre, idxPedido].forEach(i => { if (i > 0 && i < finCab) finCab = i; });
+    if (finCab > 1500) finCab = 1500;
+    const cabecera = tN.slice(0, finCab);
+
+    let numero = '';
+
+    // 3.1) Tipo de documento + N° dentro del encabezado
+    const m1 = cabecera.match(
+      /(?:NOTA\s+DE\s+(?:D[EÉ]BITO|CR[EÉ]DITO)|FACTURA)\s+ELECTR[ÓO]NICA[\s\S]{0,80}?N[°ºoO0]?\s*[:\.\-\s]{0,8}0*(\d{1,12})/i
+    );
+    if (m1) numero = m1[1];
+
+    // 3.2) Fallback: cualquier "N° <numero>" dentro del encabezado
+    if (!numero) {
+      const m2 = cabecera.match(/N[°ºoO]\s*[:\.\-\s]{0,8}0*(\d{1,12})/);
+      if (m2) numero = m2[1];
+    }
+
+    // 3.3) Fallback final: patrones tradicionales (para DTE atípicos
+    //      que no pongan el N° antes de S.I.I. / NOMBRE / PEDIDO)
+    if (!numero) {
+      const patrones = [
+        /(?:FOLIO|N[°ºo]?\s*(?:DE\s*)?FACTURA|FACTURA\s*N[°ºo]?|N[°ºo]?\s*DOCUMENTO|N[°ºo]?\s*DTE|N[°ºo]?\s*INTERNO)\s*:?\s*0*(\d{1,12})/i,
+        /\bN[°º]\s*:?\s*0*(\d{1,12})/
+      ];
+      for (const re of patrones) {
+        const m = tN.match(re);
+        if (m) { numero = m[1]; break; }
+      }
+    }
+
+    if (numero && !/^0+$/.test(numero) && !/^(19|20)\d{2}$/.test(numero)) {
+      out.fNumero = numero;
+    }
+  }
+
+  // ─── 4) FECHAS — sólo se extraen, nunca se calculan ───
+  {
+    const _f = _extraerFechasEmiVen(tN);
+    out.fEmision = _f.emision;
+    out.fVencimiento = _f.vencimiento;
+  }
+
+  // 🔎 Diagnóstico — quitar cuando funcione
+  try {
+    const ctxE = tN.match(/.{0,40}EMISI.{0,60}/i);
+    const ctxV = tN.match(/.{0,40}VENCIMIENTO.{0,60}/i);
+    Logger.log('[EMOAC FECHAS] emisión ctx: ' + (ctxE ? JSON.stringify(ctxE[0]) : '(no encontrado)'));
+    Logger.log('[EMOAC FECHAS] vencim. ctx: ' + (ctxV ? JSON.stringify(ctxV[0]) : '(no encontrado)'));
+    Logger.log('[EMOAC FECHAS] resultado: emi=' + out.fEmision + ' ven=' + out.fVencimiento);
+  } catch (e) { }
+
+  // ─── 5) PREPROCESADO DE LA TABLA DE CARGOS (SOLO PÁGINA 1) ───
+  //  Todo lo que sigue trabaja exclusivamente con la tabla oficial
+  //  CODIGO/DETALLE/CANTIDAD/PRECIO UNIT/TOTAL y el pie Afecto/Exento/
+  //  IVA/Total de la página 1. Nunca se usan "Mes de consumo", "Monto
+  //  neto", "Monto exento" ni "Total a pagar" (esos viven en el
+  //  reporte informativo de páginas siguientes).
+  let t = t0;
+  t = t.replace(/([A-Za-zÁÉÍÓÚÑáéíóúñ])(\d)/g, '$1 $2');
+  t = t.replace(/(\d)([A-Za-zÁÉÍÓÚÑáéíóúñ])/g, '$1 $2');
+
+  // ─── 6) PERÍODO — desde la línea de detalle "CODIGO ... / MES AÑO" ───
+  const MESES_TXT = {
+    ENERO: '01', FEBRERO: '02', MARZO: '03', ABRIL: '04', MAYO: '05', JUNIO: '06',
+    JULIO: '07', AGOSTO: '08', SEPTIEMBRE: '09', SETIEMBRE: '09',
+    OCTUBRE: '10', NOVIEMBRE: '11', DICIEMBRE: '12'
+  };
+  {
+    const mPer = tN.match(/\/\s*(ENERO|FEBRERO|MARZO|ABRIL|MAYO|JUNIO|JULIO|AGOSTO|SEPTIEMBRE|SETIEMBRE|OCTUBRE|NOVIEMBRE|DICIEMBRE)\s+(\d{4})/i);
+    if (mPer) {
+      const mes = MESES_TXT[mPer[1].toUpperCase()];
+      if (mes) out.fPeriodo = mPer[2] + '-' + mes;
+    }
+    if (!out.fPeriodo) {
+      const mPer2 = tN.match(/per[ií]odo\s*:?\s*(\d{2})[\-\/](\d{4})/i);
+      if (mPer2) out.fPeriodo = mPer2[2] + '-' + mPer2[1];
+    }
+  }
+
+  // ─── 7) MONTOS — por códigos 691xxx de la tabla oficial (página 1) ───
+  //  Suministro (afecto):        691020 ENERGIA, 691021 CARGO DEMANDA HP
+  //  Legales (cargo suministro): 691023 CEN, 691024 TRANSPORTE,
+  //                              691034 LEY 20.780, 691035 SERV.PUB BASE,
+  //                              691036 SERV.PUB FET
+  //  Peaje distribución (DX):    691029 COMPRA POTENCIA DX,
+  //                              691030 ENERGIA DX, 691032 POTENCIA
+  //                              SUMINISTRADA DX, 691038 CARGO FIJO DX,
+  //                              691039 CARGO POTENCIA HP DX
+  //  Intereses suministro:       691010
+  //  Intereses peaje (DX):       691040
+  //  Otros peaje (DX):           691041
+  // Suministro: 691020, 691021, 691024, 691035, 691036, 691023, 691034
+  const SUM = { '691020': 1, '691021': 1, '691024': 1, '691035': 1, '691036': 1 };
+  const LEGALES = { '691023': 1, '691034': 1 };
+  // Peaje: 691029, 691030, 691032, 691038, 691039
+  const PEAJE = { '691029': 1, '691030': 1, '691032': 1, '691038': 1, '691039': 1 };
+  // Arriendo medidor: 691041
+  const ARRIENDO = { '691041': 1 };
+  const INT_SUM = { '691010': 1 };
+  const INT_PEAJE = { '691040': 1 };
+  const OTROS_PEAJE = {};
+
+  let sum = 0, peaje = 0, intSum = 0, intPeaje = 0, otrosPeaje = 0, arriendo = 0, kwh = 0;
+  let tieneSum = false, tienePeaje = false, tieneArriendo = false;
+
+  const RE_NUM = /\d+(?:[.,]\d+)*/g;
+  const codeRe = /691(?:010|020|021|023|024|029|030|032|034|035|036|038|039|040|041)/g;
+  const positions = [];
+  let mcPos;
+  while ((mcPos = codeRe.exec(t)) !== null) positions.push(mcPos.index);
+  positions.push(t.length);
+
+  for (let ci = 0; ci < positions.length - 1; ci++) {
+    let chunk = t.substring(positions[ci], positions[ci + 1]);
+    // Cortar el chunk cuando aparezca cualquier marcador de fin de fila.
+    // Se añaden "Nota De Débito" y "Corrige Montos" porque la nota de
+    // referencia al pie ("... Corrige Montos Factura Electrónica N° 49285")
+    // contiene un N° que el parser confundía con el monto del cargo.
+    const corte = chunk.search(
+      /\b(Afecto|Exento|IVA|Total[\s:$]|Son\s|Timbre|Verifique|Nota\s+De\s+D|Corrige\s+Montos)/i
+    );
+    if (corte > 0) chunk = chunk.substring(0, corte);
+    const mc = chunk.match(/^(691\d{3})/);
+    if (!mc) continue;
+    const cod = mc[1];
+
+    RE_NUM.lastIndex = 0;
+    const nums = [];
+    let mm;
+    while ((mm = RE_NUM.exec(chunk)) !== null) nums.push(mm[0]);
+    if (nums.length < 2) continue;
+    const total = _inputANumero(nums[nums.length - 1]);
+
+    if (SUM[cod] || LEGALES[cod]) { sum += total; tieneSum = true; }
+    else if (PEAJE[cod]) { peaje += total; tienePeaje = true; }
+    else if (ARRIENDO[cod]) {
+      // 691041 sólo es Arriendo de Medidor si el texto de la fila lo dice.
+      // Si no, es un cargo de peaje (OTROS DX).
+      const esArriendoMedidor = /ARRIENDO\s*(DE\s*)?MEDIDOR/i.test(chunk);
+      if (esArriendoMedidor) { arriendo += total; tieneArriendo = true; }
+      else                   { peaje    += total; tienePeaje    = true; }
+    }
+    else if (OTROS_PEAJE[cod]) { otrosPeaje += total; }
+    else if (INT_SUM[cod]) { intSum += total; }
+    else if (INT_PEAJE[cod]) { intPeaje += total; }
+
+    // El kWh puede venir de la fila de suministro (691020)
+    // o de la fila de peaje (691030 ENERGIA DX).
+    if ((cod === '691020' || cod === '691030') && !kwh) {
+      // La cantidad precede a la palabra KWH en el layout de EMOAC.
+      // Ejemplos:
+      //   "ENERGIA 2287 / AGOSTO 2026 181.618,540 KWH ..."
+      //   "ENERGIA DX 9458517 / JUNIO 2026 23.244,400 KWH ..."
+      // El patrón captura el número en notación chilena seguido de KWH.
+      const mK = chunk.match(/(\d{1,3}(?:\.\d{3})*(?:,\d+)?)\s*KWH/i);
+      if (mK) kwh = _inputANumero(mK[1]);
+    }
+  }
+
+  // ─── 8) TOTAL — extraído SOLO de la página 1, NUNCA calculado ───
+  //  La página 1 contiene la única fuente oficial del total:
+  //    · "Total$22.530.025"  (pegado al $, sin espacio)
+  //    · o "Total: $22.530.025" / "Total $ 22.530.025"
+  //  Además, al final de la página 1 aparece SIEMPRE:
+  //    · "Son … Pesos chilenos"  (número en palabras)
+  //  Las páginas informativas (2, 3, …) traen "Total a pagar" y
+  //  "Subtotal suministro" con valores que pueden diferir del oficial
+  //  (por redondeo o por desfase del reporte). Por eso acotamos la
+  //  búsqueda al bloque de página 1: desde el inicio hasta el texto
+  //  "Son … Pesos chilenos" o el Timbre SII.
+  let totalPagar = 0;
+  {
+    // Delimitar zona de página 1
+    let zonaPag1 = tN;
+    const idxSon    = tN.search(/\bSon\s+[A-ZÁÉÍÓÚÑ\s]+\s+Pesos\s+chilenos/i);
+    const idxTimbre = tN.search(/Timbre\s+Electr[oó]nico|Res\.\s*80\s+del/i);
+    const cortes = [idxSon, idxTimbre].filter(x => x > 0);
+    if (cortes.length) zonaPag1 = tN.slice(0, Math.min(...cortes));
+
+    // 1) "Total" con $ obligatorio, dentro de la página 1
+    const m1 = zonaPag1.match(/\bTotal\s*[:\-]?\s*\$+\s*([\d\.]+(?:,\d+)?)/i);
+    if (m1) {
+      const n = _inputANumero(m1[1]);
+      if (n >= 100000 && !(n >= 690000 && n <= 692000)) totalPagar = n;
+    }
+
+    // 2) Respaldo: "Total a pagar $X" (por si el layout viniera sin "Total$X")
+    if (!totalPagar) {
+      const m2 = zonaPag1.match(/\bTotal\s*a\s*pagar\s*[:\-]?\s*\$+\s*([\d\.]+(?:,\d+)?)/i);
+      if (m2) {
+        const n = _inputANumero(m2[1]);
+        if (n >= 100000 && !(n >= 690000 && n <= 692000)) totalPagar = n;
+      }
+    }
+
+    // 3) Último recurso: número en palabras ("Son … Pesos chilenos")
+    if (!totalPagar) {
+      totalPagar = _numeroEnPalabrasAPeso(tN);
+    }
+  }
+
+  out.fSum = Math.round(sum + intSum);
+  out.fPeaje = Math.round(peaje + intPeaje);
+  out.fKwh = kwh;
+  out.fInt = Math.round(intSum);
+  out.fIntPeaje = Math.round(intPeaje);
+  out.fOtros = 0;
+  out.fOtrosPeaje = Math.round(otrosPeaje + arriendo);
+  out.fTotal = Math.round(totalPagar) || 0;
+  // Prioridad pedida por el usuario:
+  //   sum + peaje      → UNIFICADA
+  //   sum + arriendo   → CONSUMO
+  //   peaje + arriendo → PEAJE
+  //   solo arriendo    → ARRIENDO_MEDIDOR
+  //   solo peaje       → PEAJE
+  //   resto            → CONSUMO
+  out.fTipo = (tieneSum && tienePeaje)      ? 'UNIFICADA'
+            : (tieneSum && tieneArriendo)   ? 'SUMINISTRO'
+            : (tienePeaje && tieneArriendo) ? 'PEAJE'
+            : (tieneArriendo)               ? 'ARRIENDO_MEDIDOR'
+            : (tienePeaje)                  ? 'PEAJE'
+            :                                 'SUMINISTRO';
+
+  if (!out.fPeriodo && out.fEmision) out.fPeriodo = out.fEmision.slice(0, 7);
+
+  // ⚠ Vencimiento: NUNCA se calcula. Si no aparece en el PDF, queda vacío.
+
+  return out;
+}
+
+function _parsearAciertaDTE(textoOriginal) {
+  const _log = (m) => { try { Logger.log('[Acierta] ' + m); } catch(e) {} };
+  const t0 = String(textoOriginal || '');
+  const out = { fDTE: true, fEmpresa: 'Acierta' };
+
+  _log('t0.length=' + t0.length);
+  _log('t0(0..500)=' + JSON.stringify(t0.slice(0, 500)));
+
+  const tN = t0
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, ' ')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[“”„«»]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[–—−]/g, '-')
+    .replace(/[ \t]+/g, ' ');
+
+  // ─── 1) N° FACTURA ───
+  try {
+    let num = '';
+    let m = tN.match(/FACTURA\s+ELECTR[OÓ]NICA[\s\S]{0,150}?\b0*(\d{4,12})\b/i);
+    if (m) num = m[1].replace(/^0+/, '');
+    if (!num) {
+      m = tN.match(/\bN[°ºoO0]\s*[:\.\-]?\s*0*(\d{4,12})\b/i);
+      if (m) num = m[1].replace(/^0+/, '');
+    }
+    if (/^(19|20)\d{2}$/.test(num)) num = '';
+    if (/^5[6-9]\d{7,}$/.test(num)) num = '';
+    if (num) out.fNumero = num;
+    _log('fNumero=' + out.fNumero);
+  } catch (e) { _log('ERR 1: ' + e.message); }
+
+  // ─── 2) RUT / CÓDIGO CLIENTE ───
+  try {
+    let rut = '';
+    let re = /(?<!\d)(\d{1,3}\.\d{3}\.\d{3})\s*-?\s*([\dKk])(?![\d])/g;
+    let mm;
+    while ((mm = re.exec(tN)) !== null) {
+      const r = mm[1].replace(/\./g, '') + '-' + mm[2].toUpperCase();
+      if (!_esRutAcierta(r) && !_esRutEmoac(r)) { rut = r; break; }
+    }
+    if (!rut) {
+      re = /(?<!\d)(\d{7,8})\s*-\s*([\dKk])(?![\d])/g;
+      while ((mm = re.exec(tN)) !== null) {
+        const r = mm[1] + '-' + mm[2].toUpperCase();
+        if (!_esRutAcierta(r) && !_esRutEmoac(r)) { rut = r; break; }
+      }
+    }
+    if (rut) { out.fCodigo = rut; out.fRut = rut; }
+    _log('fCodigo=' + out.fCodigo);
+  } catch (e) { _log('ERR 2: ' + e.message); }
+
+  // ─── 3) EMISIÓN / VENCIMIENTO ───
+  try {
+    const mE = tN.match(/Emisi[oó0]n\s*:?\s*(\d{1,2})\s*[-\/\.]\s*(\d{1,2})\s*[-\/\.]\s*(\d{4})/i);
+    if (mE) out.fEmision = mE[3] + '-' +
+      String(parseInt(mE[2], 10)).padStart(2, '0') + '-' +
+      String(parseInt(mE[1], 10)).padStart(2, '0');
+
+    const mV = tN.match(/Vencimiento\s*:?\s*(\d{1,2})\s*[-\/\.]\s*(\d{1,2})\s*[-\/\.]\s*(\d{4})/i);
+    if (mV) out.fVencimiento = mV[3] + '-' +
+      String(parseInt(mV[2], 10)).padStart(2, '0') + '-' +
+      String(parseInt(mV[1], 10)).padStart(2, '0');
+    _log('fEmision=' + out.fEmision + ' fVencimiento=' + out.fVencimiento);
+  } catch (e) { _log('ERR 3: ' + e.message); }
+
+  // ─── 4) PERÍODO ───
+  try {
+    const m = tN.match(/periodo\s*:?\s*(\d{2})\s*[-\/]\s*(\d{4})/i);
+    if (m) out.fPeriodo = m[2] + '-' + m[1];
+    if (!out.fPeriodo && out.fEmision) out.fPeriodo = out.fEmision.slice(0, 7);
+    _log('fPeriodo=' + out.fPeriodo);
+  } catch (e) { _log('ERR 4: ' + e.message); }
+
+  // ─── 5) MONTOS DEL PIE ───
+  let exento = 0, neto = 0, iva = 0, total = 0;
+  try {
+    const _monto = (etq) => {
+      const re = new RegExp(etq + '[\\s\\S]{0,30}?\\$\\s*(\\d{1,3}(?:\\.\\d{3})+(?:,\\d+)?)', 'i');
+      const mm = tN.match(re);
+      return mm ? _inputANumero(mm[1]) : 0;
+    };
+    exento = _monto('\\bExento');
+    neto   = _monto('\\bNeto\\s*:');
+    iva    = _monto('I\\.?\\s*V\\.?\\s*A\\.?');
+    total  = _monto('\\bTotal\\s*:');
+    if (!neto)  neto  = _monto('\\bNeto');
+    if (!total) total = _monto('\\bTotal');
+    _log('exento=' + exento + ' neto=' + neto + ' iva=' + iva + ' total=' + total);
+  } catch (e) { _log('ERR 5: ' + e.message); }
+
+  // ─── 6) PEAJE ───
+  let peaje = 0;
+  try {
+    const re = /PEAJES?\s*DX([\s\S]{0,80}?)(?=\d+\s*(?:PASS|ENER|POTE|PEAJ)\b|\s*(?:Exento|Neto|I\.?V\.?A\.?|Total)\b|$)/i;
+    const m = tN.match(re);
+    if (m) {
+      const nums = m[1].match(/\d{1,3}(?:\.\d{3})+/g) || [];
+      const validos = nums.map(n => _inputANumero(n)).filter(n => n >= 1000);
+      if (validos.length) peaje = validos[validos.length - 1];
+    }
+    _log('peaje=' + peaje);
+  } catch (e) { _log('ERR 6: ' + e.message); }
+
+  // ─── 7) kWh ───
+  let kwh = 0;
+  try {
+    const m = tN.match(/ENERG[IÍ]A\s*(\d{1,3}(?:\.\d{3})+,\d{1,3})/i);
+    if (m) kwh = _inputANumero(m[1]);
+    if (!kwh) {
+      const m2 = tN.match(/ENERG[IÍ]A\s*(\d{3,}(?:,\d{1,3})?)/i);
+      if (m2) kwh = _inputANumero(m2[1]);
+    }
+    _log('kwh=' + kwh);
+  } catch (e) { _log('ERR 7: ' + e.message); }
+
+  // ─── 8) SUMINISTRO NETO ───
+  let sum = 0;
+  try {
+    if (neto > 0) sum = neto + exento - peaje;
+    else if (total > 0) sum = total - iva - peaje;
+    if (sum < 0) sum = 0;
+  } catch (e) { _log('ERR 8: ' + e.message); }
+
+  out.fSum        = Math.round(sum);
+  out.fPeaje      = Math.round(peaje);
+  out.fKwh        = kwh;
+  out.fTotal      = Math.round(total || (neto + iva + exento));
+  out.fInt        = 0;
+  out.fIntPeaje   = 0;
+  out.fOtros      = 0;
+  out.fOtrosPeaje = 0;
+  out.fTipo       = (out.fPeaje > 0 && out.fSum > 0) ? 'UNIFICADA'
+                  : (out.fPeaje > 0) ? 'PEAJE'
+                  : 'CONSUMO';
+
+  _log('RESULTADO: ' + JSON.stringify(out));
+  return out;
+}
+
+function _parsearFacturaCompleta(textoOriginal) {
+  const t0 = String(textoOriginal || '');
+  const proveedor = _detectarProveedor(t0);
+  Logger.log('[Router] Proveedor detectado: ' + proveedor);
+  try {
+    const r = (proveedor === 'ACIERTA') ? _parsearAciertaDTE(t0) : _parsearEMOACDTE(t0);
+    return r || {};
+  } catch (e) {
+    Logger.log('[Router] ✗ ERROR en ' + proveedor + ': ' + e.message +
+               ' | stack: ' + (e.stack || '(sin stack)'));
+    return { fDTE: true, fEmpresa: proveedor, _error: String(e.message || e) };
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ *  ★★★  FIN DEL BLOQUE DE PARSING  ★★★
+ * ═══════════════════════════════════════════════════════════════ */
+
+// ============================================================
+//  DIAGNÓSTICO — reporte consolidado por PDF
+// ============================================================
+let _DIAG_BUFFER = [];
+let _DIAG_INTENTOS = [];
+
+function _logDiag(msg) {
+  try { Logger.log(msg); } catch (e) { }
+  _DIAG_BUFFER.push(String(msg));
+}
+
+function _diagReset(nombreArchivo) {
+  _DIAG_BUFFER = [];
+  _DIAG_INTENTOS = [];
+  _DIAG_ARCHIVO = String(nombreArchivo || 'factura.pdf');
+}
+let _DIAG_ARCHIVO = '';
+
+/**
+ * Registra un intento de extracción en el buffer de diagnóstico.
+ */
+function _diagIntentar(fuente, ok, datos) {
+  datos = datos || {};
+  const campos = datos.campos || null;
+  const entry = {
+    fuente: String(fuente || '?'),
+    ok: !!ok,
+    chars: datos.chars || 0,
+    error: datos.error || '',
+    campos: campos,
+    preview: (datos.preview || '').slice(0, 300)
+  };
+  _DIAG_INTENTOS.push(entry);
+
+  // Log inmediato resumido por fuente
+  if (ok && campos) {
+    const det = _contarCamposDetectadosBack(campos);
+    Logger.log('[DIAG] ' + fuente + ' → OK · chars=' + entry.chars +
+      ' · campos=' + det.total + '/' + det.totalClaves +
+      (det.faltantes.length ? ' · faltan: ' + det.faltantes.join(', ') : ''));
+  } else {
+    Logger.log('[DIAG] ' + fuente + ' → FALLO · ' + (entry.error || 'sin detalle'));
+  }
+}
+
+/**
+ * Emite el reporte final con todas las fuentes intentadas.
+ */
+function _diagReporteFinal(camposFinales, fuenteFinal, ok) {
+  const lineas = [];
+  const sep = '═══════════════════════════════════════════════════════════════';
+
+  lineas.push(sep);
+  lineas.push('📋 DIAGNÓSTICO · ' + _DIAG_ARCHIVO);
+  lineas.push(sep);
+
+  _DIAG_INTENTOS.forEach((it, i) => {
+    lineas.push('');
+    lineas.push('[' + (i + 1) + '] Fuente: ' + it.fuente);
+    lineas.push('    Estado: ' + (it.ok ? '✓ OK' : '✗ ' + (it.error || 'sin texto')));
+    if (it.chars) lineas.push('    Chars extraídos: ' + it.chars);
+    if (it.campos) {
+      const claves = ['fNumero', 'fCodigo', 'fRut', 'fPeriodo', 'fEmision', 'fVencimiento',
+        'fKwh', 'fSum', 'fPeaje', 'fInt', 'fIntPeaje', 'fOtros', 'fOtrosPeaje', 'fTotal', 'fTipo'];
+      const presentes = claves.filter(k => {
+        const v = it.campos[k];
+        return v !== undefined && v !== null && v !== '' && v !== 0;
+      });
+      lineas.push('    Campos presentes (' + presentes.length + '/' + claves.length + '):');
+      presentes.forEach(k => {
+        lineas.push('      ✓ ' + k.padEnd(14) + ' = ' + JSON.stringify(it.campos[k]));
+      });
+    }
+    if (it.preview) lineas.push('    Preview: ' + it.preview.replace(/\n/g, ' ⏎ '));
+  });
+
+  lineas.push('');
+  lineas.push('▶ RESULTADO FINAL');
+  lineas.push('    Fuente elegida: ' + (fuenteFinal || '(ninguna)'));
+  lineas.push('    Válido (fNumero && fCodigo): ' + (ok ? 'SÍ' : 'NO'));
+  if (camposFinales) {
+    const claves = ['fNumero', 'fCodigo', 'fRut', 'fPeriodo', 'fEmision', 'fVencimiento',
+      'fKwh', 'fSum', 'fPeaje', 'fInt', 'fIntPeaje', 'fOtros', 'fOtrosPeaje', 'fTotal', 'fTipo'];
+    claves.forEach(k => {
+      const v = camposFinales[k];
+      const tiene = v !== undefined && v !== null && v !== '' && v !== 0;
+      lineas.push('    ' + (tiene ? '✓' : '✗') + ' ' +
+        k.padEnd(14) + ' = ' + (tiene ? JSON.stringify(v) : '(vacío)'));
+    });
+  }
+  lineas.push(sep);
+
+  Logger.log(lineas.join('\n'));
+}
+
+/**
+ * Cuenta campos presentes/faltantes en un objeto de campos.
+ */
+function _contarCamposDetectadosBack(campos) {
+  const claves = ['fNumero', 'fCodigo', 'fRut', 'fPeriodo', 'fEmision', 'fVencimiento',
+    'fKwh', 'fSum', 'fPeaje', 'fInt', 'fIntPeaje', 'fOtros', 'fOtrosPeaje', 'fTotal'];
+  let total = 0;
+  const faltantes = [];
+  claves.forEach(k => {
+    const v = campos[k];
+    const tiene = v !== undefined && v !== null && v !== '' && v !== 0;
+    if (tiene) total++;
+    else faltantes.push(k);
+  });
+  return { total, totalClaves: claves.length, faltantes };
+}
+
+/**
+ * Determina si un conjunto de campos es "utilizable" — es decir,
+ * tiene los dos identificadores mínimos: N° Factura y Código.
+ */
+function _camposSonUtilizables(campos) {
+  if (!campos) return false;
+  return !!(campos.fNumero && campos.fCodigo);
+}
+
+// ============================================================
+//  CONFIG
+// ============================================================
+const CENTROS_SEED = [
+  { codigo: '9471077', cliente: 'Costanera Centro', empConsumo: '22228', empPeaje: '9471077', empresa: 'EMOAC' },
+  { codigo: '9458517', cliente: 'Esmeralda', empConsumo: '22227', empPeaje: '9458517', empresa: 'EMOAC' },
+  { codigo: '6318907', cliente: 'Gildemeister SB', empConsumo: '7974', empPeaje: '6318907', empresa: 'EMOAC' },
+  { codigo: '2920599-K', cliente: 'Gildemeister LC', empConsumo: '2287', empPeaje: '2920599-K', empresa: 'EMOAC' },
+  { codigo: '3208008-1', cliente: 'Indumotora', empConsumo: '23801', empPeaje: '3208008-1', empresa: 'EMOAC' },
+  { codigo: '9664646', cliente: 'Maipú Antofagasta', empConsumo: '22226', empPeaje: '9664646', empresa: 'EMOAC' },
+  { codigo: '1519912-1', cliente: 'Marchant Pereira', empConsumo: '23805', empPeaje: '1519912-1', empresa: 'EMOAC' },
+  { codigo: '53300319-2', cliente: 'Neruda', empConsumo: '—', empPeaje: '—', empresa: 'Acierta', rut: '53300319-2' },
+  { codigo: '3225893-K', cliente: 'Pamplona Providencia', empConsumo: '23802', empPeaje: '3225893-K', empresa: 'EMOAC' },
+  { codigo: '6110269', cliente: 'Pamplona Viña', empConsumo: '22198', empPeaje: '6110269', empresa: 'EMOAC' },
+  { codigo: '3063395-4', cliente: 'Parque Titanium Torre B', empConsumo: '2263', empPeaje: '2263', empresa: 'EMOAC' },
+  { codigo: '1382786-9', cliente: 'Patio Isidora', empConsumo: '23804', empPeaje: '1382786-9', empresa: 'EMOAC' },
+  { codigo: '3019239-7', cliente: 'Plaza Bellet', empConsumo: '2291', empPeaje: '3019239-7', empresa: 'EMOAC' },
+  { codigo: '3325148-3', cliente: 'Plaza Costanera', empConsumo: '23803', empPeaje: '3325148-3', empresa: 'EMOAC' },
+  { codigo: '3092278-6', cliente: 'StgoDowntown', empConsumo: '4051', empPeaje: '3092278-6', empresa: 'EMOAC' }
+];
+
+let _configCache = null;
+
+// Cache con TTL corto: si pasan más de 30s desde la última lectura,
+// se relee la hoja Config. Esto evita que una edición hecha por el
+// usuario (nombre de centro, empresa, etc.) quede "invisible" para
+// el backend durante toda la sesión de Apps Script.
+const CONFIG_TTL_MS = 30 * 1000;
+let _configCacheTs = 0;
+
+function leerConfig() {
+  const ahora = Date.now();
+  if (_configCache && (ahora - _configCacheTs) < CONFIG_TTL_MS) {
+    return _configCache;
+  }
+  const ss = SpreadsheetApp.openById(SS_ID);
+  let sh = ss.getSheetByName(HOJA_CONFIG);
+  if (!sh) { sh = ss.insertSheet(HOJA_CONFIG); _initConfig(sh); }
+  const lr = Math.max(sh.getLastRow(), 1);
+  let periodos = [];
+  if (lr >= 2) {
+    const vals = sh.getRange(2, 1, lr - 1, 1).getValues();
+    periodos = vals.map(r => String(r[0]).trim()).filter(p => /^\d{4}-\d{2}$/.test(p));
+  }
+  let centros = [];
+  if (lr >= 2) {
+    const colFin = Math.max(sh.getLastColumn(), 9);
+    const nCols = Math.min(9, colFin - 1);
+    const vals = sh.getRange(2, 2, lr - 1, nCols).getValues();
+    centros = vals
+      .filter(r => String(r[1] || '').trim() && String(r[2] || '').trim())
+      .map(r => ({
+        rut: String(r[0] || '').trim() || String(r[7] || '').trim(),
+        codigo: String(r[1]).trim(),
+        cliente: String(r[2]).trim(),
+        empConsumo: String(r[3] || '').trim(),
+        empPeaje: String(r[4] || '').trim(),
+        driveOp: String(r[5] || '').trim(),
+        driveCom: String(r[6] || '').trim(),
+        empresa: String(r[8] || '').trim() || 'EMOAC'
+      }));
+  }
+  _configCache = { periodos, centros };
+  _configCacheTs = ahora;
+  return _configCache;
+}
+
+/**
+ * Fuerza la recarga de Config en la próxima llamada a leerConfig().
+ * Se llama desde los handlers que modifican la hoja Config.
+ */
+function _invalidarConfigCache() {
+  _configCache = null;
+  _configCacheTs = 0;
+}
+
+function _initConfig(sh) {
+  sh.clear();
+  const hdr = ['Periodo', 'RUT', 'Código', 'Cliente', 'Empalme Suministro', 'Empalme Peaje', 'DriveOp', 'DriveCom', 'Rut (legacy)', 'Empresa'];
+  sh.getRange(1, 1, 1, hdr.length).setValues([hdr]);
+  sh.getRange(1, 1, 1, hdr.length).setFontWeight('bold').setBackground('#1e293b').setFontColor('#ffffff');
+  if (PERIODOS_SEED.length) {
+    sh.getRange(2, 1, PERIODOS_SEED.length, 1).setValues(PERIODOS_SEED.map(p => [p]));
+    sh.getRange(2, 1, PERIODOS_SEED.length, 1).setNumberFormat('@');
+  }
+  if (CENTROS_SEED.length) {
+    sh.getRange(2, 2, CENTROS_SEED.length, 9).setValues(
+      CENTROS_SEED.map(c => [
+        c.rut || '', c.codigo || '', c.cliente || '',
+        c.empConsumo || '', c.empPeaje || '',
+        c.driveOp || '', c.driveCom || '', '',
+        c.empresa || 'EMOAC'
+      ])
+    );
+  }
+  sh.setColumnWidth(1, 100); sh.setColumnWidth(3, 120); sh.setColumnWidth(4, 220);
+  sh.setColumnWidth(5, 140); sh.setColumnWidth(6, 140); sh.setColumnWidth(7, 280);
+  sh.setColumnWidth(8, 280); sh.setColumnWidth(9, 140); sh.setColumnWidth(10, 120);
+  sh.setFrozenRows(1);
+}
+
+function agregarPeriodoConfig(periodo) {
+  periodo = String(periodo || '').trim();
+  if (!/^\d{4}-\d{2}$/.test(periodo)) return { ok: false, error: 'Formato YYYY-MM' };
+  const ss = SpreadsheetApp.openById(SS_ID);
+  let sh = ss.getSheetByName(HOJA_CONFIG);
+  if (!sh) { _configCache = null; leerConfig(); sh = ss.getSheetByName(HOJA_CONFIG); }
+  const lr = Math.max(sh.getLastRow(), 1);
+  let periodos = [];
+  if (lr >= 2) {
+    const vals = sh.getRange(2, 1, lr - 1, 1).getValues();
+    periodos = vals.map(r => String(r[0]).trim()).filter(p => /^\d{4}-\d{2}$/.test(p));
+  }
+  if (periodos.includes(periodo)) return { ok: false, error: 'Ya existe ' + periodo };
+  periodos.push(periodo); periodos.sort();
+  sh.getRange(2, 1, sh.getMaxRows() - 1, 1).clearContent();
+  sh.getRange(2, 1, periodos.length, 1).setValues(periodos.map(p => [p]));
+  sh.getRange(2, 1, periodos.length, 1).setNumberFormat('@');
+  _configCache = null;
+  refrescarSeguimiento();
+  return { ok: true, periodos };
+}
+
+function agregarCentroConfig(centro) {
+  if (!centro || !centro.codigo || !centro.cliente)
+    return { ok: false, error: 'Falta código o cliente' };
+  const ss = SpreadsheetApp.openById(SS_ID);
+  let sh = ss.getSheetByName(HOJA_CONFIG);
+  if (!sh) { _configCache = null; leerConfig(); sh = ss.getSheetByName(HOJA_CONFIG); }
+  const lr = Math.max(sh.getLastRow(), 1);
+  if (lr >= 2) {
+    const vals = sh.getRange(2, 3, lr - 1, 2).getValues();
+    const dup = vals.some(r => String(r[0]).trim() === String(centro.codigo).trim());
+    if (dup) return { ok: false, error: 'Ya existe el código ' + centro.codigo };
+  }
+  _asegurarColumnaEmpresa(sh);
+  const nextRow = lr + 1;
+  sh.getRange(nextRow, 2, 1, 9).setValues([[
+    String(centro.rut || '').trim(),
+    String(centro.codigo).trim(),
+    String(centro.cliente).trim(),
+    String(centro.empConsumo || '').trim(),
+    String(centro.empPeaje || '').trim(),
+    '', '', '',
+    String(centro.empresa || 'EMOAC').trim() || 'EMOAC'
+  ]]);
+  _invalidarConfigCache();
+  refrescarSeguimiento();
+  return { ok: true };
+}
+
+function _asegurarColumnaEmpresa(sh) {
+  if (!sh) return;
+  const lastCol = sh.getLastColumn();
+  if (lastCol < 10) {
+    const c = sh.getRange(1, 10);
+    if (!String(c.getValue() || '').trim()) {
+      c.setValue('Empresa').setFontWeight('bold').setBackground('#1e293b').setFontColor('#ffffff');
+    }
+    sh.setColumnWidth(10, 120);
+  }
+}
+
+function actualizarInfoCentroConfig(codigo, cambios) {
+  const cod = String(codigo || '').trim();
+  if (!cod) return { ok: false, error: 'Falta código' };
+  if (!cambios || typeof cambios !== 'object') return { ok: false, error: 'Sin cambios' };
+  const campos = Object.keys(cambios).filter(k => ['cliente', 'empresa'].indexOf(k) !== -1);
+  if (!campos.length) return { ok: false, error: 'Nada para actualizar' };
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const sh = ss.getSheetByName(HOJA_CONFIG);
+  if (!sh) return { ok: false, error: 'No existe la hoja Config' };
+  const lr = Math.max(sh.getLastRow(), 1);
+  if (lr < 2) return { ok: false, error: 'Config vacía' };
+  const codigos = sh.getRange(2, 3, lr - 1, 1).getValues();
+  let fila = -1;
+  for (let i = 0; i < codigos.length; i++) {
+    if (String(codigos[i][0]).trim() === cod) { fila = i + 2; break; }
+  }
+  if (fila === -1) return { ok: false, error: 'Centro no encontrado: ' + cod };
+  if (cambios.cliente !== undefined && cambios.cliente !== null) {
+    const v = String(cambios.cliente).trim();
+    if (v) sh.getRange(fila, 4).setValue(v);
+  }
+  if (cambios.empresa !== undefined && cambios.empresa !== null) {
+    _asegurarColumnaEmpresa(sh);
+    const v = String(cambios.empresa).trim() || 'EMOAC';
+    sh.getRange(fila, 10).setValue(v);
+  }
+  _configCache = null;
+  return { ok: true, fila: fila };
+}
+
+function guardarRutCentroConfig(codigo, rut) {
+  const cod = String(codigo || '').trim();
+  const r = String(rut || '').trim();
+  if (!cod) return { ok: false, error: 'Falta código' };
+  if (!r) return { ok: false, error: 'Falta RUT' };
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const sh = ss.getSheetByName(HOJA_CONFIG);
+  if (!sh) return { ok: false, error: 'No existe la hoja Config' };
+  const lr = Math.max(sh.getLastRow(), 1);
+  if (lr < 2) return { ok: false, error: 'Config vacía' };
+  const codigos = sh.getRange(2, 3, lr - 1, 1).getValues();
+  let fila = -1;
+  for (let i = 0; i < codigos.length; i++) {
+    if (String(codigos[i][0]).trim() === cod) { fila = i + 2; break; }
+  }
+  if (fila === -1) return { ok: false, error: 'Centro no encontrado: ' + cod };
+  const celda = sh.getRange(fila, 2);
+  const actual = String(celda.getValue() || '').trim();
+  if (actual) return { ok: true, guardado: false, motivo: 'ya tenía RUT', rut: actual };
+  celda.setValue(r);
+  celda.setNumberFormat('@');
+  _configCache = null;
+  return { ok: true, guardado: true, rut: r, fila: fila };
+}
+
+// ============================================================
+//  DRIVE
+// ============================================================
+function parseDriveId(input) {
+  if (!input) return '';
+  const s = String(input).trim();
+  if (!s) return '';
+  if (/^[a-zA-Z0-9_-]{15,}$/.test(s)) return s;
+  let m = s.match(/[?&]id=([^&\s]+)/);
+  if (m) return decodeURIComponent(m[1]);
+  m = s.match(/\/(?:folders|d)\/([^\/?\s&]+)/);
+  if (m) return decodeURIComponent(m[1]);
+  return s;
+}
+
+function subirFacturaDrive(codigoCliente, nombreArchivo, base64, mimeType) {
+  const codigo = String(codigoCliente || '').trim();
+  if (!codigo) return { ok: false, error: 'Falta el código de cliente.' };
+  const config = leerConfig();
+  const centro = config.centros.find(c => c.codigo === codigo);
+  if (!centro) return { ok: false, error: 'Centro "' + codigo + '" no encontrado en Config.' };
+  if (!centro.driveOp) return { ok: false, error: 'El centro "' + centro.cliente + '" no tiene Drive de Operaciones configurado.' };
+  const bytes = Utilities.base64Decode(base64);
+  const nombre = nombreArchivo || 'factura.pdf';
+  const mime = mimeType || 'application/pdf';
+  const archivos = [];
+  const errores = [];
+  if (centro.driveOp) {
+    try {
+      const f = DriveApp.getFolderById(centro.driveOp).createFile(Utilities.newBlob(bytes, mime, nombre));
+      archivos.push({ carpeta: 'Drive de Operaciones', id: f.getId(), url: f.getUrl(), nombre: f.getName() });
+    } catch (e) { errores.push({ carpeta: 'Drive de Operaciones', error: e.message }); }
+  }
+  if (centro.driveCom) {
+    try {
+      const f = DriveApp.getFolderById(centro.driveCom).createFile(Utilities.newBlob(bytes, mime, nombre));
+      archivos.push({ carpeta: 'Drive de la Comunidad', id: f.getId(), url: f.getUrl(), nombre: f.getName() });
+    } catch (e) { errores.push({ carpeta: 'Drive de la Comunidad', error: e.message }); }
+  }
+  if (!archivos.length) {
+    return { ok: false, error: 'No se pudo subir. ' + errores.map(e => e.carpeta + ': ' + e.error).join(' · ') };
+  }
+  return { ok: true, archivos, errores, centro: centro.cliente };
+}
+
+/**
+ * Vincula un PDF (ID de Drive) a la factura indicada.
+ *
+ * Si el ID ya está asociado a OTRA factura distinta y no se pasa
+ * `forzar = true`, no toca nada y devuelve:
+ *   { ok: false, conflicto: true, facturasEnConflicto: [...] }
+ * para que el frontend ofrezca reasignarlo.
+ *
+ * Con `forzar = true` desvincula el ID de las facturas anteriores y lo
+ * asigna a la nueva.
+ */
+function vincularPDFDrive(numero, urlOrId, nombreArchivo, forzar) {
+  const id = parseDriveId(urlOrId);
+  if (!id) return { ok: false, error: 'Falta el ID o URL del archivo' };
+
+  let file;
+  try { file = DriveApp.getFileById(id); }
+  catch (e) { return { ok: false, error: 'No se pudo acceder al archivo: ' + e.message }; }
+
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  const data = sh.getDataRange().getValues();
+  const numBuscado = String(numero).trim();
+
+  const filasDestino   = [];   // filas de la factura nueva
+  const filasConflicto = [];   // filas de otras facturas que ya tienen este ID
+
+  for (let i = 1; i < data.length; i++) {
+    const numFila = String(data[i][COL.NUMERO - 1] || '').trim();
+    const idFila  = String(data[i][COL.PDF_ID  - 1] || '').trim();
+    if (numFila === numBuscado) {
+      filasDestino.push(i + 1);
+    } else if (idFila === id) {
+      filasConflicto.push({
+        fila:    i + 1,
+        numero:  numFila,
+        cliente: String(data[i][COL.CLIENTE - 1] || '').trim(),
+        periodo: String(data[i][COL.PERIODO - 1] || '').trim()
+      });
+    }
+  }
+
+  if (!filasDestino.length) {
+    return { ok: false, error: 'Factura no encontrada: ' + numBuscado };
+  }
+
+  // Conflicto sin permiso explícito → sólo informar, no modificar nada.
+  if (filasConflicto.length && !forzar) {
+    return {
+      ok: false,
+      conflicto: true,
+      id: id,
+      numeroNuevo: numBuscado,
+      facturasEnConflicto: filasConflicto.map(x => ({
+        numero:  x.numero,
+        cliente: x.cliente,
+        periodo: x.periodo
+      }))
+    };
+  }
+
+  // Renombrar sólo cuando ya decidimos aplicar el cambio.
+  if (nombreArchivo) {
+    try { file.setName(String(nombreArchivo).trim()); } catch (e) {}
+  }
+
+  // Desvincular de las facturas anteriores.
+  filasConflicto.forEach(x => {
+    const c = sh.getRange(x.fila, COL.PDF_ID);
+    c.setValue('');
+    c.setNumberFormat('@');
+  });
+
+  // Asignar a la factura nueva.
+  filasDestino.forEach(fr => {
+    const c = sh.getRange(fr, COL.PDF_ID);
+    c.setValue(id);
+    c.setNumberFormat('@');
+  });
+
+  return {
+    ok: true,
+    id: id,
+    url: 'https://drive.google.com/file/d/' + id + '/view',
+    nombre: file.getName(),
+    asociados: filasDestino.length,
+    desvinculados: filasConflicto.length,
+    facturasDesvinculadas: filasConflicto.map(x => ({
+      numero:  x.numero,
+      cliente: x.cliente,
+      periodo: x.periodo
+    }))
+  };
+}
+
+/**
+ * Reemplaza el PDF_ID de una factura por otro (para cuando el
+ * original fue a la papelera y el usuario consigue el nuevo ID).
+ * No renombra ni copia el archivo nuevo: sólo actualiza la BD.
+ * Si el archivo nuevo tiene el nombre estándar, se respeta tal cual.
+ */
+function reemplazarPDFFactura(numero, nuevoId) {
+  const num = String(numero || '').trim();
+  const id  = parseDriveId(nuevoId);
+  if (!num) return { ok: false, error: 'Falta N° factura' };
+  if (!id)  return { ok: false, error: 'Falta ID de Drive' };
+
+  // Confirmar acceso al archivo nuevo.
+  let file;
+  try { file = DriveApp.getFileById(id); }
+  catch (e) { return { ok: false, error: 'No se puede acceder al archivo: ' + e.message }; }
+
+  // Detectar si el archivo nuevo está en papelera.
+  let enPapelera = false;
+  try { enPapelera = file.isTrashed(); } catch (e) {}
+  if (enPapelera) return { ok: false, error: 'El archivo indicado está en la papelera.' };
+
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  const data = sh.getDataRange().getValues();
+  let fila = -1;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][COL.NUMERO - 1]).trim() === num) { fila = i + 1; break; }
+  }
+  if (fila === -1) return { ok: false, error: 'Factura no encontrada: ' + num };
+
+  const c = sh.getRange(fila, COL.PDF_ID);
+  c.setValue(id);
+  c.setNumberFormat('@');
+
+  return {
+    ok: true,
+    numero: num,
+    id: id,
+    nombre: file.getName(),
+    url: file.getUrl()
+  };
+}
+
+/**
+ * Verifica el estado del archivo apuntado por un PDF_ID:
+ *   · ok         → existe y no está en papelera
+ *   · papelera   → existe pero está trashed
+ *   · inexistente→ no se puede acceder (borrado definitivo o sin permisos)
+ */
+function verificarEstadoPDF(id) {
+  const limpio = parseDriveId(id);
+  if (!limpio) return { ok: false, estado: 'inexistente', error: 'ID vacío' };
+  try {
+    const file = DriveApp.getFileById(limpio);
+    let trashed = false;
+    try { trashed = file.isTrashed(); } catch (e) {}
+    if (trashed) {
+      return { ok: true, estado: 'papelera', id: limpio, nombre: file.getName() };
+    }
+    return {
+      ok: true, estado: 'ok', id: limpio,
+      nombre: file.getName(), url: file.getUrl()
+    };
+  } catch (e) {
+    return { ok: false, estado: 'inexistente', error: String(e.message || e) };
+  }
+}
+
+/**
+ * Busca en el Drive de Operaciones (y, si aplica, en el de la Comunidad)
+ * del centro un archivo cuyo nombre contenga el N° de factura.
+ * Devuelve el PRIMER match encontrado con su metadata.
+ *
+ * @param {string} codigo    Código del centro (clave en Config)
+ * @param {string} numero    N° de factura a buscar en el nombre
+ * @returns {{
+ *   ok: boolean,
+ *   encontrado: boolean,
+ *   id?: string, nombre?: string, url?: string,
+ *   carpeta?: 'Operaciones'|'Comunidad',
+ *   error?: string
+ * }}
+ */
+function _buscarPDFEnDriveDelCentro(codigo, numero) {
+  const cod = String(codigo || '').trim();
+  const num = String(numero || '').trim();
+  if (!cod) return { ok: false, encontrado: false, error: 'Falta código de centro' };
+  if (!num) return { ok: false, encontrado: false, error: 'Falta N° de factura' };
+
+  const cfg = leerConfig();
+  const centro = cfg.centros.find(c => String(c.codigo || '').trim() === cod);
+  if (!centro) return { ok: false, encontrado: false, error: 'Centro no encontrado: ' + cod };
+
+  const carpetas = [];
+  if (centro.driveOp)  carpetas.push({ tipo: 'Operaciones', id: centro.driveOp });
+  if (centro.driveCom && centro.driveCom !== centro.driveOp) {
+    carpetas.push({ tipo: 'Comunidad', id: centro.driveCom });
+  }
+  if (!carpetas.length) {
+    return { ok: false, encontrado: false, error: 'El centro no tiene Drive configurado' };
+  }
+
+  // El N° puede venir con o sin ceros a la izquierda. Se busca por
+  // coincidencia parcial del número (con word boundary) para tolerar
+  // nombres como "..._56390_..." o "..._00056390_...".
+  const numLimpio = num.replace(/^0+/, '') || num;
+  const reNum = new RegExp('(?:^|[^0-9])0*' + numLimpio + '(?:[^0-9]|$)');
+
+  for (const carpeta of carpetas) {
+    let folder;
+    try { folder = DriveApp.getFolderById(carpeta.id); }
+    catch (e) { continue; }   // carpeta inaccesible → siguiente
+
+    const files = folder.getFiles();
+    while (files.hasNext()) {
+      const f = files.next();
+      let nombre = '';
+      try { nombre = f.getName(); } catch (e) { continue; }
+
+      // Sólo PDFs y que contengan el N° de factura.
+      if (!/\.pdf$/i.test(nombre)) continue;
+      if (!reNum.test(nombre)) continue;
+
+      // Verificar que no esté en papelera (por las dudas).
+      let trashed = false;
+      try { trashed = f.isTrashed(); } catch (e) {}
+      if (trashed) continue;
+
+      return {
+        ok: true,
+        encontrado: true,
+        id: f.getId(),
+        nombre: nombre,
+        url: f.getUrl(),
+        carpeta: carpeta.tipo
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    encontrado: false,
+    error: 'No se encontró ningún PDF con N° ' + num + ' en los Drives del centro'
+  };
+}
+
+/**
+ * Copia (o renombra in-place) un PDF ya existente en Drive a los
+ * repositorios de Operaciones y Comunidad del centro indicado.
+ * Si el archivo ya está en alguno de ellos, sólo lo renombra.
+ * Si no está, lo copia.
+ *
+ * @param {string} idOrigen       ID o URL del archivo PDF
+ * @param {string} codigoCliente  Código del centro (clave en Config)
+ * @param {string} nombreArchivo  Nombre final del archivo (con .pdf)
+ * @returns {{ ok:boolean, archivos?:Array, errores?:Array, centro?:string, error?:string }}
+ */
+function copiarPDFDriveADestinos(idOrigen, codigoCliente, nombreArchivo) {
+  const codigo = String(codigoCliente || '').trim();
+  if (!codigo) return { ok: false, error: 'Falta el código de cliente' };
+  const id = parseDriveId(idOrigen);
+  if (!id) return { ok: false, error: 'Falta el ID del archivo origen' };
+  const config = leerConfig();
+  const centro = config.centros.find(c => c.codigo === codigo);
+  if (!centro) return { ok: false, error: 'Centro no encontrado: ' + codigo };
+  if (!centro.driveOp && !centro.driveCom) return { ok: false, error: 'El centro "' + centro.cliente + '" no tiene Drive configurado.' };
+  let fileOrigen;
+  try { fileOrigen = DriveApp.getFileById(id); }
+  catch (e) { return { ok: false, error: 'No se pudo acceder al archivo de origen: ' + e.message }; }
+  const nombre = String(nombreArchivo || fileOrigen.getName() || 'factura.pdf').trim();
+  const foldersOrigen = {};
+  try {
+    const parents = fileOrigen.getParents();
+    while (parents.hasNext()) { foldersOrigen[parents.next().getId()] = true; }
+  } catch (e) { }
+  const enOp = centro.driveOp && foldersOrigen[centro.driveOp];
+  const enCom = centro.driveCom && foldersOrigen[centro.driveCom];
+  const opIgualCom = centro.driveOp && centro.driveCom && centro.driveOp === centro.driveCom;
+  const archivos = [];
+  const errores = [];
+  if (enOp || enCom || opIgualCom) {
+    try {
+      fileOrigen.setName(nombre);
+      archivos.push({
+        carpeta: enOp && enCom ? 'Operaciones + Comunidad' : enOp ? 'Drive de Operaciones' : 'Drive de la Comunidad',
+        id: fileOrigen.getId(), url: fileOrigen.getUrl(), nombre: fileOrigen.getName(), accion: 'renombrado'
+      });
+    } catch (e) { errores.push({ carpeta: 'Renombrado', error: e.message }); }
+    if (!enCom && centro.driveCom && !opIgualCom) {
+      try {
+        const blob = fileOrigen.getBlob(); const bytes = blob.getBytes();
+        const mime = blob.getContentType() || 'application/pdf';
+        const nueva = DriveApp.getFolderById(centro.driveCom).createFile(Utilities.newBlob(bytes, mime, nombre));
+        archivos.push({ carpeta: 'Drive de la Comunidad', id: nueva.getId(), url: nueva.getUrl(), nombre: nueva.getName(), accion: 'copiado' });
+      } catch (e) { errores.push({ carpeta: 'Drive de la Comunidad', error: e.message }); }
+    }
+    if (!enOp && centro.driveOp && !opIgualCom) {
+      try {
+        const blob = fileOrigen.getBlob(); const bytes = blob.getBytes();
+        const mime = blob.getContentType() || 'application/pdf';
+        const nueva = DriveApp.getFolderById(centro.driveOp).createFile(Utilities.newBlob(bytes, mime, nombre));
+        archivos.push({ carpeta: 'Drive de Operaciones', id: nueva.getId(), url: nueva.getUrl(), nombre: nueva.getName(), accion: 'copiado' });
+      } catch (e) { errores.push({ carpeta: 'Drive de Operaciones', error: e.message }); }
+    }
+  } else {
+    const blob = fileOrigen.getBlob(); const bytes = blob.getBytes();
+    const mime = blob.getContentType() || 'application/pdf';
+    if (centro.driveOp) {
+      try {
+        const nueva = DriveApp.getFolderById(centro.driveOp).createFile(Utilities.newBlob(bytes, mime, nombre));
+        archivos.push({ carpeta: 'Drive de Operaciones', id: nueva.getId(), url: nueva.getUrl(), nombre: nueva.getName(), accion: 'copiado' });
+      } catch (e) { errores.push({ carpeta: 'Drive de Operaciones', error: e.message }); }
+    }
+    if (centro.driveCom && centro.driveCom !== centro.driveOp) {
+      try {
+        const nueva = DriveApp.getFolderById(centro.driveCom).createFile(Utilities.newBlob(bytes, mime, nombre));
+        archivos.push({ carpeta: 'Drive de la Comunidad', id: nueva.getId(), url: nueva.getUrl(), nombre: nueva.getName(), accion: 'copiado' });
+      } catch (e) { errores.push({ carpeta: 'Drive de la Comunidad', error: e.message }); }
+    }
+  }
+  if (!archivos.length) return { ok: false, error: 'No se pudo procesar el PDF. ' + errores.map(e => e.carpeta + ': ' + e.error).join(' · ') };
+  return { ok: true, archivos, errores, centro: centro.cliente };
+}
+
+function verificarCarpetaDrive(id) {
+  const limpio = parseDriveId(id);
+  if (!limpio) return { ok: false, error: 'ID vacío' };
+  try {
+    const folder = DriveApp.getFolderById(limpio);
+    return { ok: true, id: limpio, nombre: folder.getName(), url: folder.getUrl() };
+  } catch (e) { return { ok: false, error: 'No se pudo acceder: ' + e.message }; }
+}
+
+function guardarDriveConfig(codigo, driveOp, driveCom) {
+  if (!codigo) return { ok: false, error: 'Falta el código del centro' };
+  const ss = SpreadsheetApp.openById(SS_ID);
+  let sh = ss.getSheetByName(HOJA_CONFIG);
+  if (!sh) { _configCache = null; leerConfig(); sh = ss.getSheetByName(HOJA_CONFIG); }
+  const lr = Math.max(sh.getLastRow(), 1);
+  let fila = -1;
+  if (lr >= 2) {
+    const codigos = sh.getRange(2, 3, lr - 1, 1).getValues();
+    for (let i = 0; i < codigos.length; i++) {
+      if (String(codigos[i][0]).trim() === String(codigo).trim()) { fila = i + 2; break; }
+    }
+  }
+  if (fila === -1) return { ok: false, error: 'Centro no encontrado: ' + codigo };
+  if (driveOp !== undefined && driveOp !== null) {
+    const c = sh.getRange(fila, 7); c.setValue(parseDriveId(driveOp)); c.setNumberFormat('@');
+  }
+  if (driveCom !== undefined && driveCom !== null) {
+    const c = sh.getRange(fila, 8); c.setValue(parseDriveId(driveCom)); c.setNumberFormat('@');
+  }
+  _configCache = null;
+  return { ok: true, fila: fila };
+}
+
+function descargarPDFDrive(id) {
+  const limpio = parseDriveId(id);
+  if (!limpio) return { ok: false, error: 'Falta el ID o URL' };
+  try {
+    const file = DriveApp.getFileById(limpio);
+    const blob = file.getBlob();
+    const base64 = Utilities.base64Encode(blob.getBytes());
+    const mime = blob.getContentType() || 'application/pdf';
+    return { ok: true, base64, mime, nombre: file.getName() };
+  } catch (e) { return { ok: false, error: 'No se pudo leer el archivo: ' + e.message }; }
+}
+
+function extraerTextoDesdeDrive(id) {
+  const limpio = parseDriveId(id);
+  if (!limpio) return { ok: false, error: 'Falta el ID o URL' };
+  try {
+    const file = DriveApp.getFileById(limpio);
+    const blob = file.getBlob();
+    const base64 = Utilities.base64Encode(blob.getBytes());
+    const mime = blob.getContentType() || 'application/pdf';
+    return extraerTextoPDF(file.getName(), base64, mime);
+  } catch (e) { return { ok: false, error: 'No se pudo leer: ' + e.message }; }
+}
+
+// ============================================================
+//  OCR tradicional (Drive OCR + OCR.space)
+// ============================================================
+function extraerTextoPDF(nombreArchivo, base64, mimeType) {
+  const r1 = _extraerConDriveOCR(nombreArchivo, base64, mimeType);
+  if (r1.ok && r1.texto && r1.texto.trim().length > 20) return r1;
+
+  const r2 = _extraerConOCRSpace(nombreArchivo, base64, mimeType);
+  if (r2.ok && r2.texto && r2.texto.trim().length > 20) {
+    r2.fallbackDesde = r1.error || 'Drive OCR sin texto';
+    return r2;
+  }
+
+  return {
+    ok: false,
+    error:
+      '⚠️ OCR no disponible.\n\n' +
+      '· Drive OCR: ' + (r1.error || 'sin texto') + '\n' +
+      '· OCR.space: ' + (r2.error || 'sin texto')
+  };
+}
+
+function _extraerConDriveOCR(nombreArchivo, base64, mimeType) {
+  // Cuota ya agotada → fallar rápido sin llamar a la API
+  if (_driveOcrEstaBloqueado()) {
+    return { ok: false, error: 'Drive OCR bloqueado por cuota (skip rápido)' };
+  }
+
+  let tmpId = null;
+  try {
+    const bytes = Utilities.base64Decode(base64);
+    const blob = Utilities.newBlob(bytes, mimeType || 'application/pdf', nombreArchivo || 'tmp.pdf');
+    const file = Drive.Files.insert(
+      { title: nombreArchivo || 'tmp' },
+      blob,
+      { convert: true, ocr: true, ocrLanguage: 'es' }
+    );
+    tmpId = file.id;
+    const doc = DocumentApp.openById(file.id);
+    const txtCompleto = doc.getBody().getText();
+    if (_esTextoBasuraBack(txtCompleto)) {
+      return { ok: false, error: 'Drive OCR devolvió texto corrupto' };
+    }
+    return { ok: true, texto: txtCompleto, motor: 'Drive OCR' };
+  } catch (e) {
+    const msg = String(e.message || e);
+    // Cuota agotada → bloquear para el resto del lote
+    if (/rate limit exceeded for OCR/i.test(msg)
+      || /User rate limit exceeded/i.test(msg)) {
+      _bloquearDriveOcrPorCuota(msg);
+      return { ok: false, error: 'Cuota Drive OCR agotada' };
+    }
+    return { ok: false, error: msg };
+  } finally {
+    if (tmpId) { try { DriveApp.getFileById(tmpId).setTrashed(true); } catch (e) { } }
+  }
+}
+
+function _getOCRSpaceKey() {
+  try {
+    const ss = SpreadsheetApp.openById(SS_ID);
+    let sh = ss.getSheetByName(HOJA_CONFIG);
+    if (!sh) return 'helloworld';
+    const v = String(sh.getRange('I2').getValue() || '').trim();
+    return (v && !/^\d{7,8}-?[\dKk]$/.test(v)) ? v : 'helloworld';
+  } catch (e) { return 'helloworld'; }
+}
+
+function _extraerConOCRSpace(nombreArchivo, base64, mimeType) {
+  try {
+    const OCR_API_KEY = _getOCRSpaceKey();
+    const bytes = Utilities.base64Decode(base64);
+    const blob = Utilities.newBlob(bytes, mimeType || 'application/pdf', nombreArchivo || 'factura.pdf');
+    const esPdf = /pdf/i.test(mimeType || '');
+    const form = {
+      apikey: OCR_API_KEY,
+      language: 'spa',
+      isOverlayRequired: 'false',
+      filetype: esPdf ? 'PDF' : 'AUTO',
+      OCREngine: '2',
+      scale: 'true',
+      isTable: 'true',
+      file: blob
+    };
+    const res = UrlFetchApp.fetch('https://api.ocr.space/parse/image', {
+      method: 'post', payload: form, muteHttpExceptions: true, timeout: 60
+    });
+    const code = res.getResponseCode();
+    if (code !== 200) return { ok: false, error: 'HTTP ' + code };
+    const json = JSON.parse(res.getContentText());
+    if (json.IsErroredOnProcessing) {
+      const msg = Array.isArray(json.ErrorMessage) ? json.ErrorMessage.join(' · ') : (json.ErrorMessage || 'Error');
+      return { ok: false, error: msg };
+    }
+    const resultados = json.ParsedResults || [];
+    const texto = (resultados[0] && resultados[0].ParsedText) || '';
+    if (!texto.trim()) return { ok: false, error: 'Sin texto' };
+    if (_esTextoBasuraBack(texto)) return { ok: false, error: 'OCR.space devolvió texto corrupto' };
+    return { ok: true, texto: texto, motor: 'OCR.space' };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+// ============================================================
+//  GEMINI — último recurso
+// ============================================================
+const GEMINI_PROMPT = [
+  'Eres un extractor de datos de facturas eléctricas chilenas.',
+  'Analiza el PDF adjunto e identifica el proveedor por el RUT emisor:',
+  '  · EMOAC / COPE-EMOAC → RUT 76.208.888-6',
+  '  · Acierta           → RUT 77.333.033-6',
+  '',
+  'REGLAS CRÍTICAS:',
+  '· Para EMOAC: el "código de cliente" viene del campo "COD. CLIENTE"',
+  '  del encabezado (junto a NOMBRE, R.U.T., DIRECCIÓN, COMUNA, CIUDAD,',
+  '  GIRO, DEUDOR SAP). Es un número de 5-8 dígitos. NUNCA uses el RUT',
+  '  del deudor ni el DEUDOR SAP como código de cliente.',
+  '· Para Acierta: el "código de cliente" es el RUT del receptor (la',
+  '  comunidad). NUNCA uses el RUT del emisor 77.333.033-6.',
+  '',
+  'Definiciones:',
+  '· fSum = suministro neto (afecto + exento), SIN peaje, SIN IVA.',
+  '· fPeaje = cargo por peaje (si aplica).',
+  '· fTotal = total a pagar (con IVA e intereses).',
+  '· fTipo: "SUMINISTRO" | "PEAJE" | "UNIFICADA" | "ARRIENDO_MEDIDOR".',
+  '· Usa "ARRIENDO_MEDIDOR" SOLO cuando la factura no traiga cargos',
+  '  de suministro ni de peaje, y su único cargo sea el arriendo de',
+  '  medidor (código 691041 en EMOAC: "OTROS DX ... Arriendo Medidor").',
+  '· fVencimiento: sólo si aparece en el PDF. Nunca lo inventes.',
+  '',
+  'Devuelve SOLO un objeto JSON crudo, sin markdown, sin ```json.',
+  '{',
+  '  "fEmpresa": "EMOAC" | "Acierta",',
+  '  "fNumero": "...", "fCodigo": "...", "fRut": "...",',
+  '  "fPeriodo": "YYYY-MM", "fEmision": "YYYY-MM-DD", "fVencimiento": "YYYY-MM-DD",',
+  '  "fKwh": 0, "fSum": 0, "fPeaje": 0, "fInt": 0, "fIntPeaje": 0,',
+  '  "fOtros": 0, "fOtrosPeaje": 0, "fTotal": 0, "fTipo": "..."',
+  '}',
+  '',
+  'Si un campo no aparece, usa "" para strings y 0 para números.'
+].join('\n');
+
+function _extraerConGemini(base64, mimeType, nombreArchivo) {
+  if (!GEMINI_API_KEY || !String(GEMINI_API_KEY).trim()) {
+    return { ok: false, error: 'GEMINI_API_KEY no configurada' };
+  }
+  let byteLength = 0;
+  try { byteLength = Utilities.base64Decode(base64).length; }
+  catch (e) { return { ok: false, error: 'Base64 inválido: ' + e.message }; }
+  if (byteLength > GEMINI_MAX_BYTES_INLINE) {
+    return { ok: false, error: 'PDF demasiado grande (' + (byteLength / 1024 / 1024).toFixed(1) + ' MB > 20 MB)' };
+  }
+  const mime = mimeType || 'application/pdf';
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+    GEMINI_MODEL + ':generateContent?key=' + encodeURIComponent(GEMINI_API_KEY);
+  const payload = {
+    contents: [{
+      parts: [
+        { text: GEMINI_PROMPT },
+        { inline_data: { mime_type: mime, data: base64 } }
+      ]
+    }],
+    generationConfig: {
+      temperature: 0.0, topP: 0.1, topK: 1,
+      maxOutputTokens: 4096,
+      responseMimeType: 'application/json'
+    }
+  };
+  let res;
+  try {
+    res = UrlFetchApp.fetch(url, {
+      method: 'post', contentType: 'application/json',
+      payload: JSON.stringify(payload), muteHttpExceptions: true,
+      timeout: GEMINI_TIMEOUT
+    });
+  } catch (e) { return { ok: false, error: 'Red: ' + e.message }; }
+  const code = res.getResponseCode();
+  const body = res.getContentText();
+  if (code !== 200) {
+    let detalle = body.slice(0, 400);
+    try {
+      const err = JSON.parse(body);
+      if (err.error && err.error.message) detalle = err.error.message;
+    } catch (e) { }
+    return { ok: false, error: 'HTTP ' + code + ' · ' + detalle };
+  }
+  let json;
+  try { json = JSON.parse(body); } catch (e) { return { ok: false, error: 'Respuesta no-JSON' }; }
+  const cands = json.candidates || [];
+  if (!cands.length) {
+    const block = json.promptFeedback && json.promptFeedback.blockReason;
+    return { ok: false, error: 'Sin candidatos' + (block ? ' (bloqueado: ' + block + ')' : '') };
+  }
+  const cand = cands[0];
+  if (cand.finishReason && cand.finishReason !== 'STOP' && cand.finishReason !== 'MAX_TOKENS') {
+    return { ok: false, error: 'finishReason: ' + cand.finishReason };
+  }
+  const parts = (cand.content && cand.content.parts) || [];
+  let texto = '';
+  for (const p of parts) { if (p && p.text) texto += p.text; }
+  if (!texto.trim()) return { ok: false, error: 'Contenido vacío' };
+  texto = texto.trim();
+  if (texto.startsWith('```')) {
+    texto = texto.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+  }
+  let campos;
+  try { campos = JSON.parse(texto); }
+  catch (e) { return { ok: false, error: 'JSON inválido' }; }
+
+  const out = {
+    fDTE: true,
+    fEmpresa: String(campos.fEmpresa || '').trim() || 'EMOAC',
+    fNumero: String(campos.fNumero || '').replace(/^0+/, '').trim(),
+    fCodigo: String(campos.fCodigo || '').trim(),
+    fRut: String(campos.fRut || '').trim(),
+    fPeriodo: String(campos.fPeriodo || '').trim(),
+    fEmision: String(campos.fEmision || '').trim(),
+    fVencimiento: String(campos.fVencimiento || '').trim(),
+    fKwh: _inputANumero(campos.fKwh),
+    fSum: Math.round(_inputANumero(campos.fSum)),
+    fPeaje: Math.round(_inputANumero(campos.fPeaje)),
+    fInt: Math.round(_inputANumero(campos.fInt)),
+    fIntPeaje: Math.round(_inputANumero(campos.fIntPeaje)),
+    fOtros: Math.round(_inputANumero(campos.fOtros)),
+    fOtrosPeaje: Math.round(_inputANumero(campos.fOtrosPeaje)),
+    fTotal: Math.round(_inputANumero(campos.fTotal)),
+    fTipo: String(campos.fTipo || 'CONSUMO').toUpperCase()
+  };
+  if (['SUMINISTRO', 'PEAJE', 'UNIFICADA', 'ARRIENDO_MEDIDOR'].indexOf(out.fTipo) === -1) {
+    out.fTipo = 'SUMINISTRO';
+  }
+  if (/^\d{2}-\d{4}$/.test(out.fPeriodo)) {
+    const p = out.fPeriodo.split('-');
+    out.fPeriodo = p[1] + '-' + p[0];
+  }
+  if (out.fEmision && !/^\d{4}-\d{2}-\d{2}$/.test(out.fEmision)) {
+    const f = _parseFechaDMY(out.fEmision); if (f) out.fEmision = f;
+  }
+  if (out.fVencimiento && !/^\d{4}-\d{2}-\d{2}$/.test(out.fVencimiento)) {
+    const f = _parseFechaDMY(out.fVencimiento); if (f) out.fVencimiento = f;
+  }
+  return { ok: true, campos: out, motor: 'Gemini (' + GEMINI_MODEL + ')' };
+}
+
+/**
+ * Endpoint de parsing completo con cascada y diagnóstico.
+ * Prioridad: Drive OCR → OCR.space → Gemini (último).
+ */
+function _parsearConCascadaBack(base64, mime, nombre) {
+  _diagReset(nombre || 'factura.pdf');
+
+  let mejorCampos = null;
+  let mejorFuente = '';
+  let mejorScore = -1;
+
+  const _evaluar = (fuente, campos, chars, preview) => {
+    const ok = _camposSonUtilizables(campos);
+    _diagIntentar(fuente, true, { campos, chars, preview });
+    const det = _contarCamposDetectadosBack(campos);
+    if (det.total > mejorScore) {
+      mejorScore = det.total;
+      mejorCampos = campos;
+      mejorFuente = fuente;
+    }
+    return ok;
+  };
+
+  // 1) Drive OCR — sólo si no está bloqueado por cuota
+  if (_driveOcrEstaBloqueado()) {
+    _diagIntentar('Drive OCR', false, { error: 'Cuota agotada (saltado)' });
+  } else {
+    const r1 = _extraerConDriveOCR(nombre, base64, mime);
+    if (r1.ok && r1.texto) {
+      const campos = _parsearFacturaCompleta(r1.texto);
+      if (_evaluar('Drive OCR', campos, r1.texto.length, r1.texto)) {
+        _diagReporteFinal(campos, 'Drive OCR', true);
+        return { ok: true, campos, fuente: 'Drive OCR' };
+      }
+    } else {
+      _diagIntentar('Drive OCR', false, { error: r1.error });
+    }
+  }
+
+  // 2) OCR.space
+  const r2 = _extraerConOCRSpace(nombre, base64, mime);
+  if (r2.ok && r2.texto) {
+    const campos = _parsearFacturaCompleta(r2.texto);
+    if (_evaluar('OCR.space', campos, r2.texto.length, r2.texto)) {
+      _diagReporteFinal(campos, 'OCR.space', true);
+      return { ok: true, campos, fuente: 'OCR.space' };
+    }
+  } else {
+    _diagIntentar('OCR.space', false, { error: r2.error });
+  }
+
+  // 3) Gemini — ÚLTIMO RECURSO
+  if (GEMINI_API_KEY && String(GEMINI_API_KEY).trim()) {
+    const g = _extraerConGemini(base64, mime, nombre);
+    if (g.ok && g.campos) {
+      if (_evaluar('Gemini (último recurso)', g.campos, 0, '')) {
+        _diagReporteFinal(g.campos, 'Gemini (último recurso)', true);
+        return { ok: true, campos: g.campos, fuente: 'Gemini (último recurso)' };
+      }
+    } else {
+      _diagIntentar('Gemini (último recurso)', false, { error: g.error });
+    }
+  } else {
+    _diagIntentar('Gemini', false, { error: 'No configurado' });
+  }
+
+  // Ninguna fuente dio campos utilizables
+  _diagReporteFinal(mejorCampos, mejorFuente || '(ninguna)', false);
+  return { ok: !!mejorCampos, campos: mejorCampos, fuente: mejorFuente, parcial: true };
+}
+
+// ============================================================
+//  UI
+// ============================================================
+function mostrarMensajeSeguro(msg) { try { SpreadsheetApp.getUi().alert(msg); } catch (e) { Logger.log(msg); } }
+
+// ============================================================
+//  UTILIDADES
+// ============================================================
+const SENTINELA_SIN_FECHA = 'Sin fecha';
+const SENTINELAS = [SENTINELA_SIN_FECHA, 'N/A', 'S/I'];
+
+function formatearFechaSegura(valor, tz) {
+  if (valor === null || valor === undefined || valor === '') return '';
+  if (valor instanceof Date) {
+    if (isNaN(valor.getTime())) return '';
+    return Utilities.formatDate(valor, tz, 'yyyy-MM-dd');
+  }
+  const s = String(valor).trim();
+  if (SENTINELAS.indexOf(s) !== -1) return s;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if (m) return m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+  return '';
+}
+
+function normalizarPeriodoLectura(valor) {
+  if (valor === null || valor === undefined || valor === '') return '';
+  if (valor instanceof Date) {
+    if (isNaN(valor.getTime())) return '';
+    return valor.getFullYear() + '-' + String(valor.getMonth() + 1).padStart(2, '0');
+  }
+  const s = String(valor).trim();
+  if (/^\d{4}-\d{1,2}$/.test(s)) {
+    const p = s.split('-');
+    return p[0] + '-' + String(parseInt(p[1], 10)).padStart(2, '0');
+  }
+  return s;
+}
+
+function parseISO(iso) {
+  const s = String(iso == null ? '' : iso).trim();
+  if (!s) return '';
+  // ISO: yyyy-mm-dd
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
+  // Chileno: dd/mm/yyyy o dd-mm-yyyy
+  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if (m) return new Date(+m[3], +m[2] - 1, +m[1]);
+  // Sentinelas y valores raros: devolver string tal cual para no romper
+  return s;
+}
+
+function fechaObjetivoJS(periodo) {
+  const p = periodo.split('-').map(Number);
+  const y = p[0], m = p[1];
+  const ny = m === 12 ? y + 1 : y;
+  const nm = m === 12 ? 1 : m + 1;
+  return new Date(ny, nm - 1, DIA_RECEPCION, 0, 0, 0, 0);
+}
+
+function formatFechaCorta(iso) {
+  if (!iso) return '';
+  const s = String(iso);
+  if (SENTINELAS.indexOf(s) !== -1) return s;
+  const p = s.split('-');
+  if (p.length < 3) return s;
+  return p[2] + '/' + p[1];
+}
+
+// ============================================================
+//  ROUTING
+// ============================================================
+function doGet(e) {
+  if (!e.parameter.accion) {
+    return HtmlService.createHtmlOutputFromFile(ARCHIVO_HTML)
+      .setTitle('Seguimiento de Facturación Electricidad - U.S. Urban Realty Chile')
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  }
+  try {
+    const a = e.parameter.accion;
+    if (a === 'datos') return jsonResp(obtenerFacturasParaFront());
+    if (a === 'resumen') return jsonResp({ resumen: calcularResumen() });
+    return jsonResp({ error: 'Acción desconocida: ' + a });
+  } catch (err) { return jsonResp({ error: err.message }); }
+}
+
+function doPost(e) {
+  try {
+    const b = JSON.parse(e.postData.contents);
+    if (b.accion === 'actualizarFecha') return jsonResp(actualizarFecha(b.numero, b.fecha, b.tipo));
+    if (b.accion === 'actualizarCampo') return jsonResp(actualizarCampo(b.numeroOriginal, b.tipoOriginal, b.periodo, b.campo, b.valor));
+    if (b.accion === 'agregarFactura') return jsonResp(agregarFacturaFront(b.datos));
+    if (b.accion === 'actualizarFactura') return jsonResp(actualizarFacturaFront(b.datos, b.idDrive));
+    if (b.accion === 'importarFacturas') return jsonResp(importarFacturasFront(b.facturas));
+    if (b.accion === 'eliminarFactura') return jsonResp(eliminarFacturaFront(b.numero, b.tipo));
+    if (b.accion === 'eliminarFacturaCompleta') return jsonResp(eliminarFacturaCompleta(b.numero));
+    if (b.accion === 'agregarPeriodo') return jsonResp(agregarPeriodoConfig(b.periodo));
+    if (b.accion === 'agregarCentro') return jsonResp(agregarCentroConfig(b.centro));
+    if (b.accion === 'subirPDF') return jsonResp(subirFacturaDrive(b.codigoCliente, b.nombreArchivo, b.base64, b.mimeType));
+    if (b.accion === 'extraerPDF') return jsonResp(extraerTextoPDF(b.nombreArchivo, b.base64, b.mimeType));
+    if (b.accion === 'verificarDrive') return jsonResp(verificarCarpetaDrive(b.id));
+    if (b.accion === 'guardarDriveConfig') return jsonResp(guardarDriveConfig(b.codigo, b.driveOp, b.driveCom));
+    if (b.accion === 'actualizarInfoCentro') return jsonResp(actualizarInfoCentroConfig(b.codigo, b.cambios));
+    if (b.accion === 'parsearFactura') return jsonResp(_parsearFacturaCompleta(b.texto));
+    if (b.accion === 'parsearFacturaCascada') return jsonResp(_parsearConCascadaBack(b.base64, b.mimeType, b.nombreArchivo));
+    if (b.accion === 'parsearFacturaGemini') return jsonResp(_parsearConCascadaBack(b.base64, b.mimeType, b.nombreArchivo));
+    if (b.accion === 'rectificarFactura')      return jsonResp(rectificarFactura(b.numero, b.nuevoCliente, b.nuevoCodigo, b.nuevoPeriodo));
+    if (b.accion === 'marcarFacturaRevisada')  return jsonResp(marcarFacturaRevisada(b.numero));
+    if (b.accion === 'construirNombreArchivo') return jsonResp({ ok: true, nombre: _construirNombreArchivoEstandar(b.datos || {}) });
+    if (b.accion === 'vincularPDF')            return jsonResp(vincularPDFDrive(b.numero, b.urlOrId, b.nombreArchivo, !!b.forzar));
+    if (b.accion === 'reemplazarPDFFactura')   return jsonResp(reemplazarPDFFactura(b.numero, b.urlOrId));
+    if (b.accion === 'verificarEstadoPDF')     return jsonResp(verificarEstadoPDF(b.id));
+    if (b.accion === 'buscarPDFEnDriveDelCentro') return jsonResp(_buscarPDFEnDriveDelCentro(b.codigo, b.numero));
+    if (b.accion === 'copiarPDFDriveADestinos') return jsonResp(copiarPDFDriveADestinos(b.id, b.codigoCliente, b.nombreArchivo));
+    if (b.accion === 'extraerPDFDrive') return jsonResp(extraerTextoDesdeDrive(b.id));
+    if (b.accion === 'descargarPDFDrive') return jsonResp(descargarPDFDrive(b.id));
+    return jsonResp({ error: 'Acción desconocida' });
+  } catch (err) { return jsonResp({ error: err.message }); }
+}
+
+// ============================================================
+//  PUENTES google.script.run
+// ============================================================
+function obtenerFacturasParaFront() {
+  const config = leerConfig();
+  return {
+    facturas: leerResumen(),
+    config: config,
+    version: String(MANUAL_VERSION || '').trim()
+  };
+}
+function actualizarFechaFront(n, f, t) { return actualizarFecha(n, f, t); }
+function actualizarCampoBridge(n, t, p, c, v) { return actualizarCampo(n, t, p, c, v); }
+function agregarFacturaFrontBridge(d) { return agregarFacturaFront(d); }
+function importarFacturasBridge(fs) { return importarFacturasFront(fs); }
+function eliminarFacturaBridge(n, t) { return eliminarFacturaFront(n, t); }
+function eliminarFacturaCompletaBridge(n) { return eliminarFacturaCompleta(n); }
+function agregarPeriodoBridge(p) { return agregarPeriodoConfig(p); }
+function agregarCentroBridge(c) { return agregarCentroConfig(c); }
+function subirPDFBridge(cc, n, b64, m) { return subirFacturaDrive(cc, n, b64, m); }
+function extraerPDFBridge(n, b64, m) { return extraerTextoPDF(n, b64, m); }
+function verificarCarpetaDriveBridge(id) { return verificarCarpetaDrive(id); }
+function copiarPDFDriveADestinosBridge(id, codigo, nombre) { return copiarPDFDriveADestinos(id, codigo, nombre); }
+function guardarDriveConfigBridge(codigo, op, com) { return guardarDriveConfig(codigo, op, com); }
+function rectificarFacturaBridge(n, nc, ncod, np) { return rectificarFactura(n, nc, ncod, np); }
+function marcarFacturaRevisadaBridge(numero) { return marcarFacturaRevisada(numero); }
+function construirNombreArchivoBridge(datos) { return _construirNombreArchivoEstandar(datos); }
+function vincularPDFBridge(n, u, nn, forzar) { return vincularPDFDrive(n, u, nn, !!forzar); }
+function reemplazarPDFFacturaBridge(n, u)    { return reemplazarPDFFactura(n, u); }
+function verificarEstadoPDFBridge(id)        { return verificarEstadoPDF(id); }
+function buscarPDFEnDriveDelCentroBridge(codigo, numero) { return _buscarPDFEnDriveDelCentro(codigo, numero); }
+function extraerTextoDesdeDriveBridge(id) { return extraerTextoDesdeDrive(id); }
+function descargarPDFDriveBridge(id) { return descargarPDFDrive(id); }
+function guardarRutCentroBridge(codigo, rut) { return guardarRutCentroConfig(codigo, rut); }
+function actualizarInfoCentroBridge(codigo, cambios) { return actualizarInfoCentroConfig(codigo, cambios); }
+function parsearFacturaBridge(texto) { return _parsearFacturaCompleta(texto); }
+function parsearFacturaCascadaBridge(base64, mimeType, nombreArchivo) {
+  return _parsearConCascadaBack(base64, mimeType, nombreArchivo);
+}
+function parsearFacturaGeminiBridge(base64, mimeType, nombreArchivo) {
+  return _parsearConCascadaBack(base64, mimeType, nombreArchivo);
+}
+
+// ============================================================
+//  MANUAL DE USUARIO
+//  Devuelve el contenido de manual.html como string para que el
+//  frontend lo inyecte en un <iframe srcdoc="...">.
+//  Se cachea en memoria durante la ejecución para no releer el
+//  archivo si el usuario abre/cierra el modal varias veces.
+// ============================================================
+let _MANUAL_HTML_CACHE_BACK = null;
+
+function obtenerHTMLManual(){
+  if(_MANUAL_HTML_CACHE_BACK !== null) return _MANUAL_HTML_CACHE_BACK;
+  try {
+    let html = HtmlService
+      .createHtmlOutputFromFile('manual')
+      .getContent();
+
+    // ─── Incrustar el mapa de imágenes de la hoja "img" ───
+    //  El manual se inyecta dentro de un <iframe srcdoc>, donde
+    //  google.script.run NO existe. Por eso las imágenes se pasan
+    //  como JSON embebido en el propio HTML. Cero hardcodeo: la
+    //  fuente sigue siendo la hoja "img" del spreadsheet.
+    // ─── Sólo IDs: el HTML se sirve al instante ───
+    //  Las imágenes se hidratan en segundo plano desde el propio
+    //  manual (ver obtenerImagenesManualHidratadasAsync), así la
+    //  ventana se abre en milisegundos y las capturas van apareciendo.
+    let mapa = {};
+    try { mapa = obtenerImagenesManual(); } catch (e) { mapa = {}; }
+    const json = JSON.stringify(mapa || {}).replace(/</g, '\\u003c');
+
+    // Reemplazar los marcadores de versión del HTML por el valor
+    // declarado en MANUAL_VERSION. Si el HTML no los tuviera, no pasa nada.
+    const version = String(MANUAL_VERSION || '').trim();
+    if (version) {
+      html = html
+        .replace(/__MANUAL_VERSION__/g, version);
+    }
+
+    const inyeccion =
+      '<script>window.__IMG_MANUAL__ = ' + json + ';<\/script>';
+
+    // Insertar justo antes del </head> para que esté disponible
+    // cuando arranque el DOMContentLoaded del manual.
+    if (/<\/head>/i.test(html)) {
+      html = html.replace(/<\/head>/i, inyeccion + '</head>');
+    } else {
+      html = inyeccion + html;
+    }
+
+    _MANUAL_HTML_CACHE_BACK = html;
+    return _MANUAL_HTML_CACHE_BACK;
+  } catch (e) {
+    return '<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;color:#b91c1c">' +
+           '<h2>⚠ No se pudo cargar el manual</h2>' +
+           '<p>' + String(e.message || e) + '</p>' +
+           '<p>Verifica que exista el archivo <code>manual.html</code> en el proyecto.</p>' +
+           '</body></html>';
+  }
+}
+
+function obtenerImagenesManual() {
+  const hoja = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('img');
+  if (!hoja) return {};
+  const lr = hoja.getLastRow();
+  if (lr < 2) return {};              // sólo encabezado o vacía
+  const datos = hoja.getRange(2, 1, lr - 1, 2).getValues();
+  const mapa = {};
+  datos.forEach(([clave, id]) => {
+    const k = String(clave || '').trim();
+    const v = String(id    || '').trim();
+    if (k && v) mapa[k] = v;
+  });
+  return mapa;
+}
+
+/**
+ * Versión "hidratada" del mapa de imágenes del manual: en vez de
+ * devolver { clave: idDrive }, devuelve { clave: dataURI }. El
+ * backend lee el blob de cada archivo una sola vez y lo entrega
+ * embebido, así el navegador no tiene que ir a buscar nada a Drive.
+ *
+ * Se cachea en memoria durante la ejecución (ScriptProperties tiene
+ * un tope de 9KB por valor — no sirve para guardar binarios grandes).
+ * El cache dura lo que dura la ejecución del script, que es
+ * suficiente: cuando el usuario abre el manual, se paga el costo
+ * una sola vez y los siguientes abrir/cerrar son instantáneos.
+ */
+let _IMG_HIDRATADAS_CACHE = null;
+
+/**
+ * Endpoint expuesto a google.script.run para que el manual, YA ABIERTO,
+ * pida las imágenes hidratadas en background. Devuelve
+ * { clave: dataURI } y reemplaza los placeholders cuando llega.
+ *
+ * Va aparte de obtenerImagenesManualHidratadas() para no romper la
+ * ruta sincrónica (que sigue disponible por si otro flujo la usa).
+ */
+function obtenerImagenesManualHidratadasAsync() {
+  return obtenerImagenesManualHidratadas();
+}
+
+function obtenerImagenesManualHidratadas() {
+  // Nota: el cache dura lo que dura la ejecución del script. Si necesitas
+  // que un cambio en la hoja "img" se refleje de inmediato, comenta esta
+  // línea o bórrala antes de servir el manual.
+  if (_IMG_HIDRATADAS_CACHE) return _IMG_HIDRATADAS_CACHE;
+
+  const mapa = obtenerImagenesManual();      // { clave: idDrive }
+  const salida = {};
+
+  Object.keys(mapa).forEach(clave => {
+    const id = mapa[clave];
+    try {
+      const file = DriveApp.getFileById(id);
+      const blob = file.getBlob();
+      const mime = blob.getContentType() || 'image/png';
+      const b64  = Utilities.base64Encode(blob.getBytes());
+      salida[clave] = 'data:' + mime + ';base64,' + b64;
+    } catch (e) {
+      // Si una imagen falla, se omite: el frontend deja el placeholder.
+      Logger.log('Imagen "' + clave + '" (' + id + ') no se pudo leer: ' + e.message);
+    }
+  });
+
+  _IMG_HIDRATADAS_CACHE = salida;
+  return salida;
+}
+// ============================================================
+//  LECTURA
+// ============================================================
+function leerResumen() {
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  if (!sh) throw new Error('No existe la hoja "' + HOJA_RESUMEN + '"');
+  const data = sh.getDataRange().getValues();
+  data.shift();
+  const tz = Session.getScriptTimeZone();
+  return data
+    .filter(function (r) { return r[COL.NUMERO - 1]; })
+    .map(function (r) {
+      return {
+        numero: String(r[COL.NUMERO - 1]).trim(),
+        codigo: String(r[COL.CODIGO - 1] || '').trim(),
+        cliente: String(r[COL.CLIENTE - 1]).trim(),
+        periodo: normalizarPeriodoLectura(r[COL.PERIODO - 1]),
+        tipo: String(r[COL.TIPO - 1] || '').trim().toUpperCase(),
+        kwh: Number(r[COL.KWH - 1]) || 0,
+        sum: Number(r[COL.SUM - 1]) || 0,
+        peaje: Number(r[COL.PEAJE - 1]) || 0,
+        intereses: Number(r[COL.INT - 1]) || 0,
+        otros: Number(r[COL.OTROS - 1]) || 0,
+        total: Number(r[COL.TOTAL - 1]) || 0,
+        fechaConsumo: formatearFechaSegura(r[COL.FECHA_SUMINISTRO - 1], tz),
+        fechaPeaje: formatearFechaSegura(r[COL.FECHA_PEAJE - 1], tz),
+        fechaEmision: formatearFechaSegura(r[COL.FECHA_EMISION - 1], tz),
+        fechaVencimiento: formatearFechaSegura(r[COL.FECHA_VENC - 1], tz),
+        pdfId: String(r[COL.PDF_ID - 1] || '').trim(),
+        intPeaje: Number(r[COL.INT_PEAJE - 1]) || 0,
+        otrosPeaje: Number(r[COL.OTROS_PEAJE - 1]) || 0
+      };
+    });
+}
+
+// ============================================================
+//  ACTUALIZAR FECHA / CAMPO
+// ============================================================
+function actualizarFecha(numero, fecha, tipo) {
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][COL.NUMERO - 1]).trim() === String(numero).trim()) {
+      const tipoFactura = String(data[i][COL.TIPO - 1] || '').toUpperCase();
+      let cols = [];
+      if (tipoFactura === 'UNIFICADA') {
+        // Una factura UNIFICADA es un único documento físico, recibido
+        // en una fecha única. Al registrar la recepción desde cualquier
+        // celda (Suministro o Peaje) en el Seguimiento, la fecha debe
+        // quedar en AMBAS columnas para reflejar que la factura completa
+        // fue recibida.
+        cols = [COL.FECHA_SUMINISTRO, COL.FECHA_PEAJE];
+      } else if (tipoFactura === 'SUMINISTRO' || tipoFactura === 'CONSUMO') cols = [COL.FECHA_SUMINISTRO];
+      else if (tipoFactura === 'PEAJE' || tipoFactura === 'ARRIENDO_MEDIDOR') cols = [COL.FECHA_PEAJE];
+      else {
+        if (Number(data[i][COL.SUM - 1]) > 0) cols.push(COL.FECHA_SUMINISTRO);
+        if (Number(data[i][COL.PEAJE - 1]) > 0) cols.push(COL.FECHA_PEAJE);
+      }
+      cols.forEach(function (col) {
+        const c = sh.getRange(i + 1, col);
+        if (SENTINELAS.indexOf(fecha) !== -1) {
+          c.setNumberFormat('@');
+          c.setValue(fecha);
+        } else if (fecha) {
+          const p = fecha.split('-').map(Number);
+          // Formato ANTES del valor: garantiza que Sheets lo almacene como Date
+          c.setNumberFormat('dd/mm/yyyy');
+          c.setValue(new Date(p[0], p[1] - 1, p[2]));
+        } else {
+          c.setValue('');
+        }
+      });
+      refrescarSeguimiento();
+      return { ok: true, numero: numero, fecha: fecha, tipo: tipoFactura };
+    }
+  }
+  return { ok: false, error: 'Factura no encontrada: ' + numero };
+}
+
+function actualizarCampo(numeroOrig, tipoOrig, periodo, campo, valor) {
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const sh = ss.getSheetByName(HOJA_RESUMEN);
+  const data = sh.getDataRange().getValues();
+  const mapa = {
+    'numero': COL.NUMERO, 'tipo': COL.TIPO,
+    'fechaConsumo': COL.FECHA_SUMINISTRO, 'fechaPeaje': COL.FECHA_PEAJE,
+    'fechaEmision': COL.FECHA_EMISION, 'fechaVencimiento': COL.FECHA_VENC,
+    'kwh': COL.KWH, 'sum': COL.SUM, 'peaje': COL.PEAJE,
+    'intereses': COL.INT, 'otros': COL.OTROS, 'total': COL.TOTAL,
+    'intPeaje': COL.INT_PEAJE, 'otrosPeaje': COL.OTROS_PEAJE
+  };
+  const col = mapa[campo];
+  if (!col) return { ok: false, error: 'Campo no permitido: ' + campo };
+  for (let i = 1; i < data.length; i++) {
+    const n = String(data[i][COL.NUMERO - 1]).trim();
+    if (n === String(numeroOrig).trim()) {
+      const celda = sh.getRange(i + 1, col);
+      if (campo.indexOf('fecha') === 0) {
+        if (SENTINELAS.indexOf(valor) !== -1) {
+          celda.setNumberFormat('@');
+          celda.setValue(valor);
+        } else if (valor) {
+          const pp = String(valor).split('-').map(Number);
+          celda.setNumberFormat('dd/mm/yyyy');
+          celda.setValue(new Date(pp[0], pp[1] - 1, pp[2]));
+        } else {
+          celda.setValue('');
+        }
+      } else if (campo === 'numero') celda.setValue(String(valor || '').trim());
+      else if (campo === 'tipo') celda.setValue(String(valor || '').trim().toUpperCase());
+      else {
+        let num = valor;
+        if (typeof valor === 'string') {
+          let s = valor.replace(/[\$\s]/g, '');
+          if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
+          else if (/^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, '');
+          num = Number(s);
+        }
+        celda.setValue(Number(num) || 0);
+      }
+      refrescarSeguimiento();
+      return { ok: true };
+    }
+  }
+  return { ok: false, error: 'Factura no encontrada' };
+}
+
+// ============================================================
+//  AGREGAR / ELIMINAR
+// ============================================================
+function agregarFacturaFront(datos) {
+  if (!datos || !datos.numero) throw new Error('Falta el N° de factura');
+  if (!datos.cliente) throw new Error('Falta el centro de costo');
+  if (!datos.periodo) throw new Error('Falta el período');
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const sh = ss.getSheetByName(HOJA_RESUMEN);
+  const existentes = leerResumen();
+  // Normalizar alias legacy "CONSUMO" → "SUMINISTRO" para que coincida
+  // con la nomenclatura actual y con los chequeos de recepción de abajo.
+  let tipoNuevo = (datos.tipo || 'SUMINISTRO').toUpperCase();
+  if (tipoNuevo === 'CONSUMO') tipoNuevo = 'SUMINISTRO';
+  const dup = existentes.find(function (f) { return f.numero === String(datos.numero).trim(); });
+  if (dup) throw new Error('Ya existe la factura N°' + datos.numero);
+  let codigo = datos.codigo || '';
+  if (!codigo) { const c = existentes.find(f => f.cliente === datos.cliente && f.codigo); if (c) codigo = c.codigo; }
+  // Prioridad para las fechas de recepción al CREAR una factura:
+  //   1. Si datos.fechaConsumo / datos.fechaPeaje vienen explícitos
+  //      (p.ej. desde CSV de importación), se respetan tal cual.
+  //   2. Si no, se deriva de datos.fecha (formulario del modal).
+  //   3. Si tampoco hay datos.fecha, se escribe SENTINELA_SIN_FECHA
+  //      cuando la columna aplica, para distinguir "recibida sin día"
+  //      de "no recibida aún".
+  const _fRecep = (aplica, fechaExplicita) => {
+    if (!aplica) return '';
+    const src = (fechaExplicita != null && fechaExplicita !== '')
+      ? fechaExplicita
+      : datos.fecha;
+    if (!src) return SENTINELA_SIN_FECHA;
+    const s = String(src).trim();
+    if (SENTINELAS.indexOf(s) !== -1) return s;
+    return parseISO(s);
+  };
+  const fC = _fRecep(
+    tipoNuevo === 'SUMINISTRO' || tipoNuevo === 'UNIFICADA',
+    datos.fechaConsumo
+  );
+  const fP = _fRecep(
+    tipoNuevo === 'PEAJE' || tipoNuevo === 'UNIFICADA',
+    datos.fechaPeaje
+  );
+  const fE = datos.fechaEmision ? parseISO(datos.fechaEmision) : '';
+  const fV = datos.fechaVencimiento ? parseISO(datos.fechaVencimiento) : '';
+  const marcaProcesado = datos.procesadoMasivo ? new Date() : '';
+  const fila = [
+    String(datos.numero).trim(), codigo, datos.cliente, datos.periodo, tipoNuevo,
+    Number(datos.kwh) || 0, Number(datos.sum) || 0, Number(datos.peaje) || 0,
+    Number(datos.intereses) || 0, Number(datos.otros) || 0,
+    Number(datos.intPeaje) || 0, Number(datos.otrosPeaje) || 0,
+    Number(datos.total) || 0,
+    fC, fP, fE, fV, '', marcaProcesado
+  ];
+  const lr = sh.getLastRow() + 1;
+  // Fijar formatos ANTES de escribir para que las fechas queden como Date
+  sh.getRange(lr, COL.CODIGO).setNumberFormat('@');
+  sh.getRange(lr, COL.PERIODO).setNumberFormat('@');
+  sh.getRange(lr, COL.FECHA_SUMINISTRO, 1, 4).setNumberFormat('dd/mm/yyyy');
+  sh.getRange(lr, COL.KWH).setNumberFormat('#,##0.00');
+  sh.getRange(lr, COL.SUM, 1, 7).setNumberFormat('$#,##0');
+  if (marcaProcesado) sh.getRange(lr, COL.PROCESADO_MASIVO).setNumberFormat('yyyy-mm-dd hh:mm');
+  sh.getRange(lr, 1, 1, fila.length).setValues([fila]);
+  let pdfInfo = null;
+  if (datos.pdfDriveUrl) {
+    try {
+      // Fuente única de verdad del nombre → _construirNombreArchivoEstandar
+      const nombreEst = _construirNombreArchivoEstandar({
+        numero:  datos.numero,
+        codigo:  codigo,
+        periodo: datos.periodo,
+        tipo:    tipoNuevo
+      });
+      const v = vincularPDFDrive(datos.numero, datos.pdfDriveUrl, nombreEst);
+      if (v.ok) pdfInfo = { id: v.id, url: v.url, nombre: v.nombre };
+    } catch (e) { }
+  }
+
+  // Marcar el PDF de esta factura como rectificado en el registro masivo,
+  // para que un repaso no vuelva a procesarlo.
+  try { _marcarFacturaComoRectificadaEnRegistro(datos.numero); } catch (e) { }
+
+  refrescarSeguimiento();
+  return { ok: true, mensaje: 'Factura ' + datos.numero + ' agregada', pdf: pdfInfo };
+}
+
+function actualizarFacturaFront(datos, idDrive) {
+  if (!datos || !datos.numero) return { ok: false, error: 'Falta el N° de factura' };
+  if (!datos.cliente) return { ok: false, error: 'Falta el centro de costo' };
+  if (!datos.periodo) return { ok: false, error: 'Falta el período' };
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  if (!sh) return { ok: false, error: 'No existe hoja Resumen' };
+  const data = sh.getDataRange().getValues();
+  const numBuscado = String(datos.numero).trim();
+  let tipoBuscado = String(datos.tipo || '').toUpperCase();
+  if (tipoBuscado === 'CONSUMO') tipoBuscado = 'SUMINISTRO';
+  const cliBuscado = String(datos.cliente || '').trim();
+  const perBuscado = String(datos.periodo || '').trim();
+  let fila = -1;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][COL.NUMERO - 1]).trim() === numBuscado) { fila = i + 1; break; }
+  }
+  if (fila === -1) return { ok: false, error: 'Factura no encontrada: ' + numBuscado };
+  const pdfIdActual = String(sh.getRange(fila, COL.PDF_ID).getValue() || '').trim();
+  const celda = (col) => sh.getRange(fila, col);
+  celda(COL.NUMERO).setValue(numBuscado);
+  celda(COL.CLIENTE).setValue(cliBuscado);
+  celda(COL.PERIODO).setValue(perBuscado).setNumberFormat('@');
+  if (datos.codigo) celda(COL.CODIGO).setValue(String(datos.codigo).trim()).setNumberFormat('@');
+  if (['SUMINISTRO', 'PEAJE', 'UNIFICADA', 'ARRIENDO_MEDIDOR'].indexOf(tipoBuscado) !== -1) celda(COL.TIPO).setValue(tipoBuscado);
+  const _n = (v) => Number(v) || 0;
+  celda(COL.KWH).setValue(_n(datos.kwh));
+  celda(COL.SUM).setValue(_n(datos.sum));
+  celda(COL.PEAJE).setValue(_n(datos.peaje));
+  celda(COL.INT).setValue(_n(datos.intereses));
+  celda(COL.OTROS).setValue(_n(datos.otros));
+  celda(COL.INT_PEAJE).setValue(_n(datos.intPeaje));
+  celda(COL.OTROS_PEAJE).setValue(_n(datos.otrosPeaje));
+  celda(COL.TOTAL).setValue(_n(datos.total));
+  const _setFecha = (col, iso) => {
+    const c = celda(col);
+    if (!iso) { c.setValue(''); return; }
+    const s = String(iso).trim();
+    if (SENTINELAS.indexOf(s) !== -1) {
+      c.setNumberFormat('@');
+      c.setValue(s);
+      return;
+    }
+    const p = s.split('-').map(Number);
+    if (isNaN(p[0]) || isNaN(p[1]) || isNaN(p[2])) { c.setValue(''); return; }
+    c.setNumberFormat('dd/mm/yyyy');
+    c.setValue(new Date(p[0], p[1] - 1, p[2]));
+  };
+  // ⚠ Sólo se escribe la fecha de recepción si el formulario la trae
+  //   explícitamente. Si viene vacía, se respeta el valor actual de la
+  //   celda (no se pisa con la fecha de hoy ni con un sentinel).
+  const _fRecepVal = (aplica, fechaExplicita) => {
+    if (!aplica) return null;                 // null = no tocar
+    const src = (fechaExplicita != null && fechaExplicita !== '')
+      ? fechaExplicita
+      : datos.fecha;
+    if (!src) return null;                    // sin dato → no tocar
+    const s = String(src).trim();
+    if (SENTINELAS.indexOf(s) !== -1) return s;
+    return s;                                 // ISO YYYY-MM-DD
+  };
+  const fC = _fRecepVal(
+    tipoBuscado === 'CONSUMO' || tipoBuscado === 'SUMINISTRO' || tipoBuscado === 'UNIFICADA',
+    datos.fechaConsumo
+  );
+  const fP = _fRecepVal(
+    tipoBuscado === 'PEAJE' || tipoBuscado === 'UNIFICADA',
+    datos.fechaPeaje
+  );
+  if (fC !== null) _setFecha(COL.FECHA_SUMINISTRO, fC);
+  if (fP !== null) _setFecha(COL.FECHA_PEAJE,   fP);
+  _setFecha(COL.FECHA_EMISION, datos.fechaEmision);
+  _setFecha(COL.FECHA_VENC, datos.fechaVencimiento);
+  let pdfIdFinal = pdfIdActual;
+  if (idDrive) {
+    const idNuevo = String(idDrive).trim();
+    if (!pdfIdActual) { celda(COL.PDF_ID).setValue(idNuevo).setNumberFormat('@'); pdfIdFinal = idNuevo; }
+    else if (pdfIdActual !== idNuevo) {
+      let pagActual = 0, pagNuevo = 0;
+      try { pagActual = _contarPaginasPdf(pdfIdActual); } catch (e) { }
+      try { pagNuevo = _contarPaginasPdf(idNuevo); } catch (e) { }
+      if (pagNuevo > pagActual) { celda(COL.PDF_ID).setValue(idNuevo).setNumberFormat('@'); pdfIdFinal = idNuevo; }
+    }
+  }
+  celda(COL.PROCESADO_MASIVO).setValue(new Date()).setNumberFormat('yyyy-mm-dd hh:mm');
+  _configCache = null;
+
+  // Marcar el PDF de esta factura como rectificado en el registro masivo,
+  // para que un repaso no vuelva a procesarlo.
+  try { _marcarFacturaComoRectificadaEnRegistro(numBuscado); } catch (e) { }
+
+  refrescarSeguimiento();
+  return { ok: true, mensaje: 'Factura ' + numBuscado + ' actualizada', pdfId: pdfIdFinal };
+}
+
+function actualizarFacturaFrontBridge(datos, idDrive) { return actualizarFacturaFront(datos, idDrive); }
+
+/**
+ * Actualiza sólo la columna "Procesadas" (PROCESADO_MASIVO) de la factura
+ * indicada, sin tocar ningún otro campo. Se usa para marcar la factura
+ * como "revisada" cuando se abre el modal, se compara contra el PDF y no
+ * hay diferencias: al cerrar, el timestamp queda registrado.
+ *
+ * No lanza error si la factura no existe (silencioso por diseño).
+ */
+function marcarFacturaRevisada(numero) {
+  const num = String(numero || '').trim();
+  if (!num) return { ok: false, error: 'Falta el N° de factura' };
+
+  try {
+    const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+    if (!sh) return { ok: false, error: 'No existe hoja Resumen' };
+
+    const lr = Math.max(sh.getLastRow(), 1);
+    if (lr < 2) return { ok: false, error: 'Sin filas' };
+
+    const nums = sh.getRange(2, COL.NUMERO, lr - 1, 1).getValues();
+    let fila = -1;
+    for (let i = 0; i < nums.length; i++) {
+      if (String(nums[i][0]).trim() === num) { fila = i + 2; break; }
+    }
+    if (fila === -1) return { ok: false, error: 'Factura no encontrada: ' + num };
+
+    const c = sh.getRange(fila, COL.PROCESADO_MASIVO);
+    c.setValue(new Date());
+    c.setNumberFormat('yyyy-mm-dd hh:mm');
+
+    return { ok: true, numero: num, fila: fila };
+  } catch (e) {
+    return { ok: false, error: String(e.message || e) };
+  }
+}
+
+function eliminarFacturaFront(numero, tipo) {
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][COL.NUMERO - 1]).trim() === String(numero).trim()) {
+      sh.deleteRow(i + 1);
+      refrescarSeguimiento();
+      return { ok: true, mensaje: 'Factura ' + numero + ' eliminada' };
+    }
+  }
+  return { ok: false, error: 'Factura no encontrada' };
+}
+
+function eliminarFacturaCompleta(numero) {
+  if (!numero) return { ok: false, error: 'Falta el N° de factura' };
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  const data = sh.getDataRange().getValues();
+  const numBuscado = String(numero).trim();
+  const filas = [];
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][COL.NUMERO - 1]).trim() === numBuscado) filas.push(i + 1);
+  }
+  if (!filas.length) return { ok: false, error: 'Factura no encontrada: ' + numBuscado };
+  filas.sort((a, b) => b - a).forEach(r => sh.deleteRow(r));
+  refrescarSeguimiento();
+  return { ok: true, numero: numBuscado, eliminadas: filas.length };
+}
+
+// ============================================================
+//  RECTIFICAR
+// ============================================================
+function rectificarFactura(numero, nuevoCliente, nuevoCodigo, nuevoPeriodo) {
+  if (!numero) return { ok: false, error: 'Falta el N° de factura' };
+  if (!nuevoCliente && !nuevoPeriodo) return { ok: false, error: 'Nada para rectificar' };
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  const data = sh.getDataRange().getValues();
+  const numBuscado = String(numero).trim();
+  let movidas = 0;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][COL.NUMERO - 1]).trim() !== numBuscado) continue;
+    if (nuevoCliente) sh.getRange(i + 1, COL.CLIENTE).setValue(String(nuevoCliente).trim());
+    if (nuevoCodigo) {
+      const c = sh.getRange(i + 1, COL.CODIGO);
+      c.setValue(String(nuevoCodigo).trim()); c.setNumberFormat('@');
+    }
+    if (nuevoPeriodo) {
+      const p = sh.getRange(i + 1, COL.PERIODO);
+      p.setValue(String(nuevoPeriodo).trim()); p.setNumberFormat('@');
+    }
+    movidas++;
+  }
+  if (movidas === 0) return { ok: false, error: 'Factura no encontrada: ' + numBuscado };
+  refrescarSeguimiento();
+  return { ok: true, numero: numBuscado, movidas: movidas };
+}
+
+// ============================================================
+//  SEGUIMIENTO
+// ============================================================
+function refrescarSeguimiento() {
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const config = leerConfig();
+  const facturas = leerResumen();
+  const porSuministro = {}; const porPeaje = {}; const porArriendo = {};
+  function estaCompleto(f) {
+    const hasMonto = (Number(f.sum) > 0) || (Number(f.peaje) > 0);
+    const hasKwh = Number(f.kwh) > 0;
+    const S = SENTINELAS;
+    const em = f.fechaEmision; const ve = f.fechaVencimiento;
+    const hasEm = em && S.indexOf(em) === -1;
+    const hasVe = ve && S.indexOf(ve) === -1;
+    return hasMonto && hasKwh && hasEm && hasVe;
+  }
+  facturas.forEach(function (f) {
+    let cod = f.codigo || '';
+    if (!cod) {
+      const m = config.centros.find(function (e) { return e.cliente === f.cliente; });
+      if (m) cod = m.codigo;
+    }
+    if (!cod) cod = '—';
+    const completo = estaCompleto(f);
+    if (f.tipo === 'SUMINISTRO' || f.tipo === 'UNIFICADA') {
+      if (!porSuministro[cod]) porSuministro[cod] = {};
+      if (!porSuministro[cod][f.periodo]) porSuministro[cod][f.periodo] = [];
+      porSuministro[cod][f.periodo].push({ numero: f.numero, fecha: f.fechaConsumo, completo: completo });
+    }
+    if (f.tipo === 'PEAJE' || f.tipo === 'UNIFICADA') {
+      if (!porPeaje[cod]) porPeaje[cod] = {};
+      if (!porPeaje[cod][f.periodo]) porPeaje[cod][f.periodo] = [];
+      porPeaje[cod][f.periodo].push({ numero: f.numero, fecha: f.fechaPeaje, completo: completo });
+    }
+    if (f.tipo === 'ARRIENDO_MEDIDOR') {
+      if (!porArriendo[cod]) porArriendo[cod] = {};
+      if (!porArriendo[cod][f.periodo]) porArriendo[cod][f.periodo] = [];
+      porArriendo[cod][f.periodo].push({ numero: f.numero, fecha: f.fechaPeaje || f.fechaConsumo, completo: completo });
+    }
+  });
+  escribirHojaSeguimiento(ss, HOJA_SUMINISTRO, porSuministro, config);
+  escribirHojaSeguimiento(ss, HOJA_PEAJE, porPeaje, config);
+  escribirHojaSeguimiento(ss, HOJA_ARRIENDO, porArriendo, config);
+}
+
+function escribirHojaSeguimiento(ss, nombre, datosPorCodigo, config) {
+  let sh = ss.getSheetByName(nombre);
+  if (!sh) sh = ss.insertSheet(nombre);
+  sh.clear();
+  const MESES = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
+  const PERIODOS = config.periodos;
+  const headers = ['Centro de costo (Código)'].concat(PERIODOS.map(function (p) {
+    const partes = p.split('-');
+    return MESES[parseInt(partes[1], 10) - 1] + '-' + partes[0];
+  }));
+  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  const centrosVisibles = config.centros.filter(function(e){
+    return !_esCentroFantasmaBack(e.codigo, e.cliente);
+  });
+  const filas = centrosVisibles.map(function (e) {
+    const fila = [e.cliente + ' (' + e.codigo + ')'];
+    const datos = datosPorCodigo[e.codigo] || {};
+    PERIODOS.forEach(function (periodo) {
+      const items = datos[periodo] || [];
+      if (items.length === 0) fila.push(estadoTextoPeriodo(periodo));
+      else {
+        // Sólo cuentan como fechas reales las que no son sentinela.
+        const fechas = items
+          .map(f => f.fecha)
+          .filter(x => x && SENTINELAS.indexOf(String(x)) === -1);
+        if (fechas.length > 0) {
+          fila.push(fechas.map(formatFechaCorta).join(' / '));
+        } else {
+          // El documento existe (factura registrada), pero no se informó la fecha.
+          const completo = items.every(it => it.completo);
+          fila.push(completo ? 'Sin fecha' : 'Sin fecha (⚠)');
+        }
+      }
+    });
+    return fila;
+  });
+  if (filas.length) sh.getRange(2, 1, filas.length, headers.length).setValues(filas);
+  sh.getRange(1, 1, 1, headers.length)
+    .setFontWeight('bold').setBackground('#1e293b').setFontColor('#ffffff')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+  if (filas.length) {
+    const rango = sh.getRange(2, 2, filas.length, PERIODOS.length);
+    const reglas = [
+      SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Pendiente').setBackground('#fef3c7').setFontColor('#92400e').setRanges([rango]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Por Emitir').setBackground('#dcfce7').setFontColor('#166534').setRanges([rango]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('S/I').setBackground('#f3f4f6').setFontColor('#6b7280').setRanges([rango]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('N/A').setBackground('#e5e7eb').setFontColor('#6b7280').setRanges([rango]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextContains('Sin fecha').setBackground('#e0f2fe').setFontColor('#075985').setRanges([rango]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextContains('⚠').setBackground('#fef9c3').setFontColor('#b45309').setRanges([rango]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenTextContains('/').setBackground('#d1fae5').setFontColor('#065f46').setRanges([rango]).build()
+    ];
+    sh.setConditionalFormatRules(reglas);
+  }
+  sh.setColumnWidth(1, 260);
+  for (let i = 2; i <= PERIODOS.length + 1; i++) sh.setColumnWidth(i, 95);
+  sh.setFrozenRows(1); sh.setFrozenColumns(1); sh.setRowHeight(1, 30);
+  if (filas.length) sh.getRange(2, 2, filas.length, PERIODOS.length).setHorizontalAlignment('center');
+}
+
+function estadoTextoPeriodo(periodo) {
+  const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+  const p = periodo.split('-').map(Number);
+  const pm = p[0] * 12 + (p[1] - 1);
+  const hm = hoy.getFullYear() * 12 + hoy.getMonth();
+  if (pm >= hm) return 'Por Emitir';
+  const dl = fechaObjetivoJS(periodo);
+  if (hoy <= dl) return 'En plazo';
+  return 'Pendiente';
+}
+
+// ============================================================
+//  IMPORTAR CSV
+// ============================================================
+function importarFacturasFront(facturas) {
+  if (!Array.isArray(facturas) || !facturas.length) throw new Error('Sin facturas');
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const sh = ss.getSheetByName(HOJA_RESUMEN);
+  const existentes = leerResumen();
+  const filas = []; const errores = []; let duplicadas = 0;
+  facturas.forEach(function (f, idx) {
+    if (!f.numero) { errores.push('Fila ' + (idx + 1) + ': sin N° factura'); return; }
+    if (!f.cliente) { errores.push('Fila ' + (idx + 1) + ': sin centro'); return; }
+    if (!f.periodo) { errores.push('Fila ' + (idx + 1) + ': sin período'); return; }
+    let tipo = (f.tipo || 'SUMINISTRO').toUpperCase();
+    if (tipo === 'CONSUMO') tipo = 'SUMINISTRO';
+    const dup = existentes.find(e => e.numero === String(f.numero).trim() && e.cliente === f.cliente && e.periodo === f.periodo && e.tipo === tipo);
+    if (dup) { duplicadas++; return; }
+    const fC = (tipo === 'SUMINISTRO' || tipo === 'UNIFICADA') && f.fechaConsumo ? parseISO(f.fechaConsumo) : '';
+    const fP = (tipo === 'PEAJE' || tipo === 'UNIFICADA') && f.fechaPeaje ? parseISO(f.fechaPeaje) : '';
+    const fE = f.fechaEmision ? parseISO(f.fechaEmision) : '';
+    const fV = f.fechaVencimiento ? parseISO(f.fechaVencimiento) : '';
+    filas.push([String(f.numero).trim(), f.codigo || '', f.cliente, f.periodo, tipo,
+    Number(f.kwh) || 0, Number(f.sum) || 0, Number(f.peaje) || 0,
+    Number(f.intereses) || 0, Number(f.otros) || 0,
+    Number(f.intPeaje) || 0, Number(f.otrosPeaje) || 0,
+    Number(f.total) || 0, fC, fP, fE, fV, '', '']);
+  });
+  if (filas.length) {
+    const sr = sh.getLastRow() + 1;
+    // Fijar formatos ANTES del setValues para que las fechas queden como Date
+    sh.getRange(sr, COL.CODIGO, filas.length, 1).setNumberFormat('@');
+    sh.getRange(sr, COL.PERIODO, filas.length, 1).setNumberFormat('@');
+    sh.getRange(sr, COL.FECHA_SUMINISTRO, filas.length, 4).setNumberFormat('dd/mm/yyyy');
+    sh.getRange(sr, COL.KWH, filas.length, 1).setNumberFormat('#,##0.00');
+    sh.getRange(sr, COL.SUM, filas.length, 7).setNumberFormat('$#,##0');
+    sh.getRange(sr, 1, filas.length, filas[0].length).setValues(filas);
+    refrescarSeguimiento();
+  }
+  return { ok: true, importadas: filas.length, duplicadas: duplicadas, errores: errores };
+}
+
+// ============================================================
+//  KPIs
+// ============================================================
+function calcularResumen() {
+  const facturas = leerResumen();
+  const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+  const acc = { total_facturas: facturas.length, total_suministro: 0, total_peaje: 0, total_intereses: 0, total_otros: 0, total_facturado: 0, recibidas: 0, pendientes: 0, porEmitir: 0, dentroPlazo: 0, sinInfo: 0, noAplica: 0 };
+  facturas.forEach(function (f) {
+    acc.total_suministro += f.sum; acc.total_peaje += f.peaje;
+    acc.total_intereses += (f.intereses + (f.intPeaje || 0));
+    acc.total_otros += (f.otros + (f.otrosPeaje || 0));
+    acc.total_facturado += f.total;
+    const _esSentinel = (v) => SENTINELAS.indexOf(String(v || '').trim()) !== -1;
+    if (f.fechaConsumo === 'N/A' || f.fechaPeaje === 'N/A') { acc.noAplica++; return; }
+    if (f.fechaConsumo === 'S/I' || f.fechaPeaje === 'S/I') { acc.sinInfo++; return; }
+    // 'Sin fecha' es un sentinel de recepción sin día: no cuenta como fecha real.
+    // (No lo clasificamos como S/I ni N/A, sino que cae al flujo de pendientes.)
+    const _sinFechaConsumo = f.fechaConsumo === SENTINELA_SIN_FECHA;
+    const _sinFechaPeaje   = f.fechaPeaje   === SENTINELA_SIN_FECHA;
+    let tieneFecha;
+    if (f.tipo === 'UNIFICADA') {
+      tieneFecha = f.fechaConsumo && f.fechaPeaje && !_sinFechaConsumo && !_sinFechaPeaje;
+    } else if (f.tipo === 'PEAJE') {
+      tieneFecha = !!f.fechaPeaje && !_sinFechaPeaje;
+    } else {
+      tieneFecha = !!f.fechaConsumo && !_sinFechaConsumo;
+    }
+    if (tieneFecha) { acc.recibidas++; return; }
+    const p = f.periodo.split('-').map(Number);
+    const pm = p[0] * 12 + (p[1] - 1);
+    const hm = hoy.getFullYear() * 12 + hoy.getMonth();
+    if (pm >= hm) { acc.porEmitir++; return; }
+    const sinInfo = !f.kwh && !f.sum && !f.peaje && !f.total;
+    if (sinInfo) { acc.sinInfo++; return; }
+    const dl = fechaObjetivoJS(f.periodo);
+    if (hoy <= dl) acc.dentroPlazo++;
+    else acc.pendientes++;
+  });
+  return acc;
+}
+
+function jsonResp(obj) { return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON); }
+
+// ============================================================
+//  MENÚ
+// ============================================================
+function onOpen() {
+  try {
+    const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_CONFIG);
+    if (sh) _asegurarColumnaEmpresa(sh);
+  } catch (e) { }
+  SpreadsheetApp.getUi()
+    .createMenu('⚡ Funciones adicionales')
+    .addItem('📂 Procesar carpeta de PDFs (masivo)', 'procesarCarpetaPDFsUI')
+    .addItem('📊 Ver registro de PDFs procesados', 'mostrarRegistroPDFsUI')
+    .addItem('🗑️ Limpiar registro de PDFs procesados', 'limpiarRegistroPDFsUI')
+    .addSeparator()
+    .addItem('🛑 Detener procesamiento indefinido', 'detenerProcesamientoIndefinidoUI')
+    .addItem('🏷️ Asegurar header "Procesado masivo"', 'asegurarHeaderProcesadoMasivo')
+    .addSeparator()
+    .addItem('🔄 Refrescar hojas de seguimiento', 'refrescarSeguimiento')
+    .addItem('🧪 Probar API', 'probarAPI')
+    .addItem('🤖 Probar Gemini', 'probarGemini')
+    .addItem('🔬 Probar parsing sobre texto (pegar en prompt)', 'probarParsingUI')
+    .addSeparator()
+    .addItem('📝 Renombrar PDFs vinculados (nuevo formato)', 'renombrarTodosLosPDFs')
+    .addItem('🔍 Previsualizar renombrado (sin aplicar)', 'previsualizarRenombradoPDFs')
+    .addSeparator()
+    .addItem('🔓 Desbloquear Drive OCR (reset cuota)', 'desbloquearDriveOcrUI')
+    .addSeparator()
+    .addItem('📅 Convertir fechas texto → Date (una vez)', 'convertirFechasTextoADate')
+    .addItem('🧹 Consolidar centro "Sin asignar" (una vez)', 'consolidarCentroSinAsignar')
+    .addItem('🔁 Migrar "Consumo" → "Suministro" (una vez)', 'migrarConsumoASuministro')
+    .addToUi();
+}
+
+function desbloquearDriveOcrUI() {
+  _desbloquearDriveOcr();
+  try { SpreadsheetApp.getUi().alert('✓ Drive OCR desbloqueado. Se reintentará en el próximo PDF.'); }
+  catch (e) { Logger.log('✓ Drive OCR desbloqueado'); }
+}
+
+function probarGemini() {
+  try {
+    if (!GEMINI_API_KEY || !String(GEMINI_API_KEY).trim()) {
+      mostrarMensajeSeguro('⚠ GEMINI_API_KEY no configurada.');
+      return;
+    }
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+      GEMINI_MODEL + ':generateContent?key=' + encodeURIComponent(GEMINI_API_KEY);
+    const payload = { contents: [{ parts: [{ text: 'Responde únicamente con la palabra OK.' }] }] };
+    const res = UrlFetchApp.fetch(url, {
+      method: 'post', contentType: 'application/json',
+      payload: JSON.stringify(payload), muteHttpExceptions: true, timeout: 30
+    });
+    const code = res.getResponseCode();
+    const body = res.getContentText();
+    if (code !== 200) { mostrarMensajeSeguro('❌ HTTP ' + code + '\n\n' + body.slice(0, 500)); return; }
+    const json = JSON.parse(body);
+    const txt = (json.candidates && json.candidates[0] && json.candidates[0].content &&
+      json.candidates[0].content.parts && json.candidates[0].content.parts[0].text) || '(sin texto)';
+    mostrarMensajeSeguro('✓ Gemini OK\n\nModelo: ' + GEMINI_MODEL + '\nRespuesta: ' + txt.trim());
+  } catch (e) { mostrarMensajeSeguro('❌ ' + e.message); }
+}
+
+function probarParsingUI() {
+  const ui = SpreadsheetApp.getUi();
+  const r = ui.prompt('Probar parser', 'Pega el texto OCR crudo (se verá en el log de Apps Script):', ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+  const texto = r.getResponseText();
+  if (!texto) return;
+  _diagReset('(texto pegado)');
+  const campos = _parsearFacturaCompleta(texto);
+  _diagIntentar('Parser manual', true, { campos, chars: texto.length, preview: texto });
+  _diagReporteFinal(campos, 'Parser manual', _camposSonUtilizables(campos));
+  const det = _contarCamposDetectadosBack(campos);
+  ui.alert('✓ Parsing ejecutado\n\nCampos detectados: ' + det.total + '/' + det.totalClaves +
+    (det.faltantes.length ? '\nFaltan: ' + det.faltantes.join(', ') : '\n¡Completo!') +
+    '\n\nRevisa el log (Ver > Registros) para el reporte detallado.');
+}
+
+function detenerProcesamientoIndefinidoUI() {
+  _borrarEstadoPDF();
+  _limpiarTriggersPDF();
+  try { SpreadsheetApp.getUi().alert('🛑 Procesamiento detenido.'); } catch (e) { Logger.log('🛑 detenido'); }
+}
+
+function autorizarTodosLosScopes() {
+  DriveApp.getFiles();
+  Drive.Files.list({ maxResults: 1 });
+  SpreadsheetApp.getActiveSpreadsheet().getName();
+  const tmp = DocumentApp.create('tmp_auth_check');
+  DriveApp.getFileById(tmp.getId()).setTrashed(true);
+  PropertiesService.getScriptProperties().getKeys();
+  ScriptApp.getProjectTriggers();
+  UrlFetchApp.fetch('https://api.ocr.space/parse/image', {
+    method: 'post', payload: { apikey: 'helloworld', filetype: 'AUTO' }, muteHttpExceptions: true
+  });
+  UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+    method: 'get', muteHttpExceptions: true
+  });
+  Logger.log('✓ Autorización completa');
+  try { SpreadsheetApp.getUi().alert('✓ Permisos concedidos'); } catch (e) { }
+}
+
+function asegurarHeaderProcesadoMasivo() {
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  if (!sh) return;
+  const encabezados = [
+    { col: COL.INT_PEAJE, txt: 'Int. Peaje' },
+    { col: COL.OTROS_PEAJE, txt: 'Otros Peaje' },
+    { col: COL.TOTAL, txt: 'Total' },
+    { col: COL.FECHA_SUMINISTRO, txt: 'F.Recep Suministro' },
+    { col: COL.FECHA_PEAJE, txt: 'F.Recep Peaje' },
+    { col: COL.FECHA_EMISION, txt: 'F.Emisión' },
+    { col: COL.FECHA_VENC, txt: 'F.Venc' },
+    { col: COL.PDF_ID, txt: 'ID Drive' },
+    { col: COL.PROCESADO_MASIVO, txt: 'Procesadas' }
+  ];
+  encabezados.forEach(({ col, txt }) => {
+    const celda = sh.getRange(1, col);
+    if (!String(celda.getValue() || '').trim()) {
+      celda.setValue(txt).setFontWeight('bold').setBackground('#1e293b')
+        .setFontColor('#ffffff').setHorizontalAlignment('center');
+    }
+  });
+}
+
+function actualizarFacturaDesdePDF(datos, idDrive, tsProcesado) {
+  if (!datos || !datos.numero) return { ok: false, error: 'Falta el N° de factura' };
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  const data = sh.getDataRange().getValues();
+  const numBuscado = String(datos.numero).trim();
+  const tipoNuevo  = String(datos.tipo || '').toUpperCase();
+
+  // ─── Localizar la fila por N° Factura (identificador único) ───
+  let fila = -1;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][COL.NUMERO - 1]).trim() === numBuscado) { fila = i + 1; break; }
+  }
+  if (fila === -1) return { ok: false, error: 'Factura no encontrada: ' + numBuscado };
+
+  const campos = [];
+  const _track = (col, fn) => { if (fn()) campos.push(col); };
+
+  if (['SUMINISTRO','PEAJE','UNIFICADA','ARRIENDO_MEDIDOR'].indexOf(tipoNuevo) !== -1) {
+    sh.getRange(fila, COL.TIPO).setValue(tipoNuevo); campos.push(COL.TIPO);
+  }
+
+  // Centro de costo también se rectifica.
+  _track(COL.CLIENTE, () => _setCeldaTexto(sh, fila, COL.CLIENTE, datos.cliente));
+  _track(COL.CODIGO,  () => _setCeldaTexto(sh, fila, COL.CODIGO,  datos.codigo));
+
+  // Período: setValue con formato texto para no perder ceros.
+  if (datos.periodo && /^\d{4}-\d{2}$/.test(String(datos.periodo).trim())) {
+    const c = sh.getRange(fila, COL.PERIODO);
+    c.setValue(String(datos.periodo).trim());
+    c.setNumberFormat('@');
+    campos.push(COL.PERIODO);
+  }
+
+  _track(COL.KWH,         () => _setCeldaNum(sh, fila, COL.KWH,         datos.kwh));
+  _track(COL.SUM,         () => _setCeldaNum(sh, fila, COL.SUM,         datos.sum));
+  _track(COL.PEAJE,       () => _setCeldaNum(sh, fila, COL.PEAJE,       datos.peaje));
+  _track(COL.INT,         () => _setCeldaNum(sh, fila, COL.INT,         datos.intereses));
+  _track(COL.OTROS,       () => _setCeldaNum(sh, fila, COL.OTROS,       datos.otros));
+  _track(COL.INT_PEAJE,   () => _setCeldaNum(sh, fila, COL.INT_PEAJE,   datos.intPeaje));
+  _track(COL.OTROS_PEAJE, () => _setCeldaNum(sh, fila, COL.OTROS_PEAJE, datos.otrosPeaje));
+  _track(COL.TOTAL,       () => _setCeldaNum(sh, fila, COL.TOTAL,       datos.total));
+  _track(COL.FECHA_EMISION, () => _setCeldaFecha(sh, fila, COL.FECHA_EMISION, datos.fechaEmision));
+  _track(COL.FECHA_VENC,    () => _setCeldaFecha(sh, fila, COL.FECHA_VENC,    datos.fechaVencimiento));
+
+  // ⚠ F.Recep Consumo / F.Recep Peaje: sólo se escriben si el caller las
+  //   pasa EXPLÍCITAMENTE y no vacías. El procesador masivo pasa '' para
+  //   ambas, por lo que nunca pisa una fecha ya registrada por el usuario.
+  if (datos.fechaConsumo != null && datos.fechaConsumo !== '') {
+    _track(COL.FECHA_SUMINISTRO, () => _setCeldaFecha(sh, fila, COL.FECHA_SUMINISTRO, datos.fechaConsumo));
+  }
+  if (datos.fechaPeaje != null && datos.fechaPeaje !== '') {
+    _track(COL.FECHA_PEAJE, () => _setCeldaFecha(sh, fila, COL.FECHA_PEAJE, datos.fechaPeaje));
+  }
+
+  let idFinal = '';
+  if (idDrive) {
+    const c = sh.getRange(fila, COL.PDF_ID);
+    c.setValue(String(idDrive).trim()).setNumberFormat('@');
+    idFinal = idDrive; campos.push(COL.PDF_ID);
+  }
+
+  const cTs = sh.getRange(fila, COL.PROCESADO_MASIVO);
+  cTs.setValue(tsProcesado instanceof Date ? tsProcesado : new Date());
+  cTs.setNumberFormat('yyyy-mm-dd hh:mm');
+  campos.push(COL.PROCESADO_MASIVO);
+
+  return { ok: true, fila: fila, campos: campos, idDrive: idFinal };
+}
+
+function obtenerInfoFactura(numero, tipo) {
+  if (!numero) return { ok: false, error: 'Falta N° de factura' };
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  if (!sh) return { ok: false, error: 'No existe hoja Resumen' };
+  const data = sh.getDataRange().getValues();
+  const numBuscado = String(numero).trim();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][COL.NUMERO - 1]).trim() !== numBuscado) continue;
+    const fila = i + 1;
+    const pdfId = String(data[i][COL.PDF_ID - 1] || '').trim();
+    const tsRaw = data[i][COL.PROCESADO_MASIVO - 1];
+    const ts = (tsRaw instanceof Date && !isNaN(tsRaw.getTime())) ? tsRaw : null;
+    return { ok: true, fila: fila, pdfId: pdfId, procesadoMasivo: ts };
+  }
+  return { ok: false, error: 'Factura no encontrada' };
+}
+
+function asegurarCentroTemporal() {
+  const CODIGO_TEMP = 'Sin código';
+  const CLIENTE_TEMP = 'Sin asignar';
+  const ss = SpreadsheetApp.openById(SS_ID);
+  let sh = ss.getSheetByName(HOJA_CONFIG);
+  if (!sh) { _configCache = null; leerConfig(); sh = ss.getSheetByName(HOJA_CONFIG); }
+  const lr = Math.max(sh.getLastRow(), 1);
+  if (lr >= 2) {
+    const vals = sh.getRange(2, 3, lr - 1, 2).getValues();
+    for (let i = 0; i < vals.length; i++) {
+      const c = String(vals[i][0] || '').trim();
+      const n = String(vals[i][1] || '').trim();
+      // Reconoce cualquier variante previa (TEMP / ⚠️ Sin asignar / Sin asignar)
+      if (_esCentroFantasmaBack(c, n)) {
+        _configCache = null;
+        return { ok: true, codigo: c || CODIGO_TEMP, cliente: n || CLIENTE_TEMP };
+      }
+    }
+  }
+  _asegurarColumnaEmpresa(sh);
+  const nextRow = lr + 1;
+  sh.getRange(nextRow, 2, 1, 9).setValues([['', CODIGO_TEMP, CLIENTE_TEMP, '', '', '', '', '', 'EMOAC']]);
+  _configCache = null;
+  return { ok: true, codigo: CODIGO_TEMP, cliente: CLIENTE_TEMP };
+}
+
+function probarAPI() {
+  try {
+    const k = calcularResumen();
+    mostrarMensajeSeguro(
+      '✓ API funcionando\n\nFacturas: ' + k.total_facturas +
+      '\nRecibidas: ' + k.recibidas +
+      '\nPendientes: ' + k.pendientes +
+      '\nDentro del plazo: ' + k.dentroPlazo +
+      '\nPor emitir: ' + k.porEmitir +
+      '\nS/I: ' + k.sinInfo +
+      '\nN/A: ' + k.noAplica +
+      '\n\n🤖 Gemini: ' + (GEMINI_API_KEY ? 'configurada' : 'NO configurada')
+    );
+  } catch (e) { mostrarMensajeSeguro('❌ ' + e.message); }
+}
+
+function reautorizar() { autorizarTodosLosScopes(); }
+
+function normalizarAliasClientes() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Resumen Facturación');
+  const data = sh.getDataRange().getValues();
+  const MAPA = {
+    'Gildemeister (SB)': 'Gildemeister SB',
+    'StgoDowntown Torre 4 y 7 (4051)': 'StgoDowntown',
+    'StgoDowntown Torre 4 y 7 (4052)': 'StgoDowntown',
+    'COMUNIDAD EDIFICIO NERUDA': 'Neruda'
+  };
+  const COL_CLIENTE = 4;
+  let cambios = 0;
+  for (let i = 1; i < data.length; i++) {
+    const actual = String(data[i][COL_CLIENTE - 1] || '').trim();
+    if (MAPA[actual]) { sh.getRange(i + 1, COL_CLIENTE).setValue(MAPA[actual]); cambios++; }
+  }
+  SpreadsheetApp.getUi().alert('✓ Nombres normalizados: ' + cambios);
+}
+
+/* ============================================================
+ *  PROCESADOR MASIVO DE PDFs (v5) — con diagnóstico
+ * ============================================================ */
+
+const HOJA_PDF_PROCESADOS = '_PDF_Procesados';
+const TIEMPO_MAX_MS = 5 * 60 * 1000;
+const PROP_KEY_ESTADO_PDF = 'EMOAC_PDF_STATE_V1';
+const ESTADOS_PROCESADOS = { ok: 1, rectificada: 1 };
+const ESTADOS_REINTENTABLES = { error_ocr: 1, error_parseo: 1 };
+
+function procesarCarpetaPDFsUI() {
+  const ui = SpreadsheetApp.getUi();
+  const r1 = ui.prompt('Paso 1/3 — Carpeta', 'Pega la URL o el ID de la carpeta de Drive a procesar.\nSe recorrerán también las subcarpetas.', ui.ButtonSet.OK_CANCEL);
+  if (r1.getSelectedButton() !== ui.Button.OK) return;
+  const url = r1.getResponseText().trim();
+  if (!url) { ui.alert('No se ingresó URL/ID.'); return; }
+
+  const r2 = ui.alert('Paso 2/3 — Cobertura', '¿Deseas OMITIR los PDFs ya procesados?', ui.ButtonSet.YES_NO_CANCEL);
+  if (r2 === ui.Button.CANCEL) return;
+  const omitirProcesados = (r2 === ui.Button.YES);
+
+  const r3 = ui.alert('Paso 3/3 — Facturas recientes', '¿Deseas OMITIR las facturas procesadas hace menos de 1 día?', ui.ButtonSet.YES_NO_CANCEL);
+  if (r3 === ui.Button.CANCEL) return;
+  const omitirRecientes = (r3 === ui.Button.YES);
+
+  const _limpieza = _limpiarReintentablesDelRegistro();
+  const estado = {
+    url: url, modo: 3,
+    incluirProcesados: !omitirProcesados,
+    reprocesarRecientes: !omitirRecientes,
+    reintentablesLimpiados: _limpieza.borradas + _limpieza.rectificadas,
+    gemini: !!(GEMINI_API_KEY && String(GEMINI_API_KEY).trim()),
+    creado: new Date().toISOString()
+  };
+  _guardarEstadoPDF(estado);
+  _limpiarTriggersPDF();
+  asegurarHeaderProcesadoMasivo();
+
+  let resultado;
+  try { resultado = _ejecutarLotePDF(estado); }
+  catch (e) { ui.alert('❌ Error: ' + e.message); return; }
+
+  if (resultado.tiempoAgotado) {
+    _programarSiguienteEjecucionPDF();
+    try { SpreadsheetApp.getActiveSpreadsheet().toast('⏳ Procesamiento en curso. Siguiente tanda ~1 min.', 'Procesamiento masivo', 15); } catch (e) { }
+    return;
+  }
+  _borrarEstadoPDF();
+  _limpiarTriggersPDF();
+  const msg = _resumenResultado(resultado, estado) + '\n\n✅ Procesamiento completo.';
+  try { ui.alert(msg); }
+  catch (e) {
+    try { SpreadsheetApp.getActiveSpreadsheet().toast('✅ Procesamiento completo · ' + resultado.ok + ' facturas', 'Procesamiento masivo', 30); } catch (e2) { }
+  }
+}
+
+function _continuarEjecucionPDF() {
+  const estado = _leerEstadoPDF();
+  if (!estado) { _limpiarTriggersPDF(); return; }
+  let resultado;
+  try { resultado = _ejecutarLotePDF(estado); }
+  catch (e) { Logger.log('Error continuación: ' + e.message); _borrarEstadoPDF(); _limpiarTriggersPDF(); return; }
+  if (resultado.tiempoAgotado) { _programarSiguienteEjecucionPDF(); return; }
+  _borrarEstadoPDF();
+  _limpiarTriggersPDF();
+  const msg = _resumenResultado(resultado, estado) + '\n\n✅ Procesamiento completo.';
+  try { SpreadsheetApp.getActiveSpreadsheet().toast('✅ ' + resultado.ok + ' facturas · ' + resultado.errores + ' errores', 'Procesamiento masivo', 30); } catch (e) { }
+  try {
+    const email = Session.getEffectiveUser().getEmail();
+    MailApp.sendEmail({ to: email, subject: '✅ Procesamiento masivo terminado', body: msg + '\n\nRevisa "' + HOJA_PDF_PROCESADOS + '" para el detalle.' });
+  } catch (e) { Logger.log('No se pudo enviar email: ' + e.message); }
+  Logger.log(msg);
+}
+
+function _guardarEstadoPDF(estado) { PropertiesService.getScriptProperties().setProperty(PROP_KEY_ESTADO_PDF, JSON.stringify(estado)); }
+function _leerEstadoPDF() {
+  const s = PropertiesService.getScriptProperties().getProperty(PROP_KEY_ESTADO_PDF);
+  if (!s) return null;
+  try { return JSON.parse(s); } catch (e) { return null; }
+}
+function _borrarEstadoPDF() { PropertiesService.getScriptProperties().deleteProperty(PROP_KEY_ESTADO_PDF); }
+function _programarSiguienteEjecucionPDF() {
+  _limpiarTriggersPDF();
+  ScriptApp.newTrigger('_continuarEjecucionPDF').timeBased().after(60 * 1000).create();
+}
+function _limpiarTriggersPDF() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === '_continuarEjecucionPDF') {
+      try { ScriptApp.deleteTrigger(t); } catch (e) { }
+    }
+  });
+}
+
+function _registrarPDFEnDup(dupRegistro, numero, tipo, id, path, paginas) {
+  if (!dupRegistro || !id) return;
+  const num = String(numero || '').trim();
+  const tpo = String(tipo || '').toUpperCase();
+  if (!num || !tpo) return;
+  const key = num + '|' + tpo;
+  if (!dupRegistro[key]) dupRegistro[key] = [];
+  if (dupRegistro[key].some(a => a.id === id)) return;
+  dupRegistro[key].push({ id, path: path || '', paginas: Number(paginas) || 0 });
+}
+
+function _calcularDuplicados(dupRegistro) {
+  const resultado = [];
+  Object.entries(dupRegistro || {}).forEach(([key, archivos]) => {
+    if (!archivos || archivos.length < 2) return;
+    const [numero, tipo] = key.split('|');
+    resultado.push({ numero, tipo, archivos: archivos.slice().sort((a, b) => a.id.localeCompare(b.id)) });
+  });
+  resultado.sort((a, b) => a.numero.localeCompare(b.numero));
+  return resultado;
+}
+
+function _ejecutarLotePDF(estado) {
+  const folderId = parseDriveId(estado.url);
+  if (!folderId) throw new Error('URL/ID inválido.');
+  let folder;
+  try { folder = DriveApp.getFolderById(folderId); }
+  catch (e) { throw new Error('No se pudo acceder a la carpeta: ' + e.message); }
+
+  const pdfs = [];
+  _listarPDFsRecursivo(folder, pdfs, '');
+  const totalEncontrados = pdfs.length;
+
+  const reg = cargarRegistroPDFs();
+  let lista = pdfs.slice();
+  let totalFiltradosPorRegistro = 0;
+  if (!estado.incluirProcesados) {
+    const antes = lista.length;
+    lista = lista.filter(p => {
+      let id;
+      try { id = p.file.getId(); } catch (e) { return false; }
+      const prev = reg[id];
+      return !prev || !ESTADOS_PROCESADOS[prev.estado];
+    });
+    totalFiltradosPorRegistro = antes - lista.length;
+  }
+
+  lista.sort((a, b) => {
+    let da, db;
+    try { da = a.file.getDateCreated().getTime(); } catch (e) { da = 0; }
+    try { db = b.file.getDateCreated().getTime(); } catch (e) { db = 0; }
+    return db - da;
+  });
+
+  const inicio = Date.now();
+  const delayMs = estado.modo === 3 ? 120000 : 0;
+  const resultado = {
+    total: lista.length, procesados: 0, saltados: 0,
+    ok: 0, duplicadas: 0, rectificadas: 0, revManual: 0, errores: 0,
+    restantes: 0, tiempoAgotado: false, detalle: [], duplicados: [],
+    totalEncontrados, totalFiltradosPorRegistro,
+    gemini: !!estado.gemini
+  };
+  const dupRegistro = {};
+
+  asegurarCentroTemporal();
+  const existentes = leerResumen();
+  const config = leerConfig();
+
+  for (let i = 0; i < lista.length; i++) {
+    if (Date.now() - inicio > TIEMPO_MAX_MS) {
+      resultado.tiempoAgotado = true;
+      resultado.restantes = lista.length - i;
+      break;
+    }
+    const item = lista[i];
+    let fileId;
+    try { fileId = item.file.getId(); } catch (e) { fileId = ''; }
+
+    if (fileId && !estado.incluirProcesados) {
+      const prev = reg[fileId];
+      if (prev && ESTADOS_PROCESADOS[prev.estado]) { resultado.saltados++; continue; }
+    }
+
+    if (delayMs > 0 && resultado.procesados > 0) {
+      if (Date.now() - inicio + delayMs > TIEMPO_MAX_MS) {
+        resultado.tiempoAgotado = true;
+        resultado.restantes = lista.length - i;
+        break;
+      }
+      Utilities.sleep(delayMs);
+    }
+
+    const r = _procesarUnPDF(item, existentes, config, true, {
+      reprocesarRecientes: !!estado.reprocesarRecientes,
+      dupRegistro
+    });
+
+    if (fileId) {
+      const _detalleFinal = [r.detalle, r.diag].filter(Boolean).join('  ||  ');
+      reg[fileId] = {
+        path: item.path,
+        estado: r.estado,
+        detalle: _detalleFinal,
+        ts: new Date().toISOString(),
+        numero: r.numeroFactura || ''
+      };
+    }
+
+    if (r.estado === 'ok') resultado.ok++;
+    else if (r.estado === 'rectificada') resultado.rectificadas++;
+    else if (r.estado === 'rev_manual') resultado.revManual++;
+    else if (r.estado === 'duplicada') resultado.duplicadas++;
+    else resultado.errores++;
+    resultado.procesados++;
+
+    if (r.estado === 'rev_manual') resultado.detalle.push({ archivo: item.path, revision: r.detalle, warning: r.warning });
+    else if (r.detalle && r.estado !== 'ok' && r.estado !== 'duplicada') resultado.detalle.push({ archivo: item.path, error: r.detalle });
+    else if (r.warning) resultado.detalle.push({ archivo: item.path, warning: r.warning });
+
+    guardarRegistroPDFs(reg);
+  }
+
+  guardarRegistroPDFs(reg);
+  refrescarSeguimiento();
+  resultado.duplicados = _calcularDuplicados(dupRegistro);
+  Logger.log(JSON.stringify(resultado, null, 2));
+  return resultado;
+}
+
+function _resumenResultado(r, estado) {
+  const lineas = [];
+  const modoTxt = estado.modo === 1 ? 'una vez' : estado.modo === 3 ? 'indefinido con pausas' : ('modo ' + estado.modo);
+  const coberturaTxt = estado.incluirProcesados ? 'TODOS' : 'solo NO procesados';
+  const motorTxt = estado.gemini ? 'OCR primero · Gemini como último recurso' : 'OCR tradicional';
+  lineas.push('📊 Resultado del lote');
+  lineas.push('');
+  lineas.push('Modo:      ' + modoTxt);
+  lineas.push('Cobertura: ' + coberturaTxt);
+  lineas.push('Motor:     ' + motorTxt);
+  lineas.push('');
+  lineas.push('PDFs en carpeta:      ' + (r.totalEncontrados != null ? r.totalEncontrados : '?'));
+  if (r.totalFiltradosPorRegistro > 0) lineas.push('  · Ya procesados:    ' + r.totalFiltradosPorRegistro);
+  lineas.push('PDFs en lote:         ' + r.total);
+  lineas.push('Saltados (registro):  ' + r.saltados);
+  lineas.push('Procesados:          ' + r.procesados);
+  lineas.push('  · Creadas:         ' + r.ok);
+  lineas.push('  · Rectificadas:    ' + (r.rectificadas || 0));
+  lineas.push('  · Rev. manual:     ' + (r.revManual || 0));
+  lineas.push('  · Duplicadas:      ' + r.duplicadas);
+  lineas.push('  · Errores:         ' + r.errores);
+  if (r.tiempoAgotado) { lineas.push(''); lineas.push('⏸️ Restantes: ' + r.restantes); }
+
+  const conProblemas = (r.detalle || []).filter(d => d.error || d.warning || d.revision);
+  if (conProblemas.length) {
+    lineas.push('');
+    lineas.push('Detalle (primeros 15):');
+    conProblemas.slice(0, 15).forEach(d => {
+      lineas.push('· ' + d.archivo);
+      if (d.revision) { lineas.push('   [rev_manual] ' + (d.warning || '')); d.revision.split('\n').forEach(l => lineas.push('   ' + l)); }
+      else lineas.push('   ' + (d.error || d.warning));
+    });
+  }
+
+  const dups = (r.duplicados || []);
+  if (dups.length) {
+    lineas.push('');
+    lineas.push('🔍 Duplicados detectados:');
+    dups.forEach(d => {
+      lineas.push('');
+      lineas.push('  ' + d.numero + ' · ' + d.tipo);
+      d.archivos.forEach(a => lineas.push('    ' + a.id + ' (' + a.paginas + ' páginas)'));
+    });
+  }
+  return lineas.join('\n');
+}
+
+function mostrarRegistroPDFsUI() {
+  const ui = SpreadsheetApp.getUi();
+  const reg = cargarRegistroPDFs();
+  const total = Object.keys(reg).length;
+  if (!total) { ui.alert('El registro está vacío.'); return; }
+  const porEstado = {};
+  Object.values(reg).forEach(v => { porEstado[v.estado] = (porEstado[v.estado] || 0) + 1; });
+  const lineas = ['📋 Registro de PDFs procesados', '', 'Total: ' + total, ''];
+  Object.keys(porEstado).sort().forEach(k => lineas.push('  · ' + k + ': ' + porEstado[k]));
+  lineas.push('');
+  lineas.push('Detalle en la hoja oculta "' + HOJA_PDF_PROCESADOS + '".');
+  ui.alert(lineas.join('\n'));
+}
+
+function limpiarRegistroPDFsUI() {
+  const ui = SpreadsheetApp.getUi();
+  const reg = cargarRegistroPDFs();
+  const total = Object.keys(reg).length;
+  if (!total) { ui.alert('El registro ya está vacío.'); return; }
+  const r = ui.alert('🗑️ Limpiar registro', 'Se borrarán ' + total + ' entradas.\n\nLa próxima ejecución procesará TODOS los PDFs.', ui.ButtonSet.YES_NO);
+  if (r !== ui.Button.YES) return;
+  limpiarRegistroPDFs();
+  ui.alert('✓ Registro limpiado.');
+}
+
+function _getHojaProcesados(ss) {
+  let sh = ss.getSheetByName(HOJA_PDF_PROCESADOS);
+  if (!sh) {
+    sh = ss.insertSheet(HOJA_PDF_PROCESADOS);
+    sh.getRange(1, 1, 1, 6).setValues([['File ID', 'Ruta', 'Estado', 'Detalle', 'Fecha', 'N° Factura']]);
+    sh.getRange(1, 1, 1, 6).setFontWeight('bold').setBackground('#1e293b').setFontColor('#ffffff');
+    sh.setFrozenRows(1);
+    _aplicarFiltroProcesados(sh);
+    sh.hideSheet();
+    return sh;
+  }
+  if (sh.getLastColumn() < 6) {
+    const c = sh.getRange(1, 6);
+    if (!String(c.getValue() || '').trim()) {
+      c.setValue('N° Factura').setFontWeight('bold').setBackground('#1e293b').setFontColor('#ffffff');
+    }
+    sh.setColumnWidth(6, 120);
+  }
+  return sh;
+}
+
+function _aplicarFiltroProcesados(sh) {
+  if (!sh) return;
+  try {
+    const filtroPrev = sh.getFilter();
+    if (filtroPrev) filtroPrev.remove();
+    const lr = Math.max(sh.getLastRow(), 1);
+    const rango = sh.getRange(1, 1, lr, 5);
+    const filtro = rango.createFilter();
+    const criterio = SpreadsheetApp.newFilterCriteria().setHiddenValues(['ok', 'rectificada']).build();
+    filtro.setColumnFilterCriteria(3, criterio);
+  } catch (e) { Logger.log('_aplicarFiltroProcesados error: ' + e.message); }
+}
+
+function cargarRegistroPDFs() {
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const sh = _getHojaProcesados(ss);
+  const lr = sh.getLastRow();
+  if (lr < 2) return {};
+  const nCols = Math.max(sh.getLastColumn(), 5);
+  const data = sh.getRange(2, 1, lr - 1, nCols).getValues();
+  const reg = {};
+  data.forEach(r => {
+    const id = String(r[0] || '').trim();
+    if (!id) return;
+    reg[id] = {
+      path: String(r[1] || ''),
+      estado: String(r[2] || ''),
+      detalle: String(r[3] || ''),
+      ts: r[4] instanceof Date ? r[4].toISOString() : String(r[4] || ''),
+      numero: String(r[5] || '').trim()
+    };
+  });
+  return reg;
+}
+
+function guardarRegistroPDFs(reg) {
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const sh = _getHojaProcesados(ss);
+  const filas = Object.entries(reg).map(([id, v]) => [
+    id, v.path || '', v.estado || '', (v.detalle || '').slice(0, 4500), v.ts || '', v.numero || ''
+  ]);
+  const lr = sh.getLastRow();
+  if (lr >= 2) sh.getRange(2, 1, lr - 1, 6).clearContent();
+  if (filas.length) sh.getRange(2, 1, filas.length, 6).setValues(filas);
+  _aplicarFiltroProcesados(sh);
+}
+
+function limpiarRegistroPDFs() {
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const sh = _getHojaProcesados(ss);
+  const lr = sh.getLastRow();
+  if (lr >= 2) sh.getRange(2, 1, lr - 1, 5).clearContent();
+  _aplicarFiltroProcesados(sh);
+}
+
+function _esReintentable(estado) { return !!ESTADOS_REINTENTABLES[estado]; }
+
+function _fechasProcesadasPorFactura() {
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  if (!sh) return {};
+  const lr = sh.getLastRow();
+  if (lr < 2) return {};
+  const data = sh.getRange(2, 1, lr - 1, COL.PROCESADO_MASIVO).getValues();
+  const mapa = {};
+  data.forEach(r => {
+    const num = String(r[COL.NUMERO - 1] || '').trim();
+    if (!num) return;
+    const tsRaw = r[COL.PROCESADO_MASIVO - 1];
+    if (!(tsRaw instanceof Date) || isNaN(tsRaw.getTime())) return;
+    if (!mapa[num] || tsRaw.getTime() > mapa[num].getTime()) mapa[num] = tsRaw;
+  });
+  return mapa;
+}
+
+function _limpiarReintentablesDelRegistro() {
+  const reg = cargarRegistroPDFs();
+  const fechasBD = _fechasProcesadasPorFactura();
+  let borradas = 0, rectificadas = 0;
+  Object.keys(reg).forEach(id => {
+    const entrada = reg[id];
+    if (ESTADOS_REINTENTABLES[entrada.estado]) { delete reg[id]; borradas++; return; }
+    if (ESTADOS_PROCESADOS[entrada.estado]) return;
+    const num = entrada.numero || _extraerNumeroDePath(entrada.path);
+    if (!num) return;
+    const fechaBD = fechasBD[num];
+    if (!fechaBD) return;
+    const fechaReg = entrada.ts ? new Date(entrada.ts) : null;
+    if (!fechaReg || isNaN(fechaReg.getTime())) return;
+    if (fechaBD.getTime() > fechaReg.getTime()) {
+      reg[id].estado = 'rectificada';
+      reg[id].detalle = 'Marcada como rectificada: BD actualizada (' + fechaBD.toISOString() + ')';
+      reg[id].ts = fechaBD.toISOString();
+      if (!reg[id].numero) reg[id].numero = num;
+      rectificadas++;
+    }
+  });
+  if (borradas > 0 || rectificadas > 0) guardarRegistroPDFs(reg);
+  return { borradas, rectificadas };
+}
+
+function _extraerNumeroDePath(path) {
+  if (!path) return '';
+  const s = String(path);
+  let m = s.match(/dte[\-_][^\/]+?-(\d{3,8})\.pdf$/i); if (m) return m[1];
+  m = s.match(/\d{4}-\d{2}_[^_]+_(\d{1,8})_[^\/]+\.pdf$/i); if (m) return m[1];
+  m = s.match(/_(\d{3,8})_[^\/]+\.pdf$/i); if (m) return m[1];
+  return '';
+}
+
+/**
+ * Marca como "rectificada" todas las entradas del registro
+ * `_PDF_Procesados` cuyo N° de factura coincida, y refresca su ts.
+ * Con esto, un repaso masivo no volverá a procesar esos PDFs
+ * (porque 'rectificada' está en ESTADOS_PROCESADOS).
+ */
+function _marcarFacturaComoRectificadaEnRegistro(numero) {
+  const num = String(numero || '').trim();
+  if (!num) return { actualizadas: 0 };
+
+  const reg = cargarRegistroPDFs();
+  const ahora = new Date().toISOString();
+  let actualizadas = 0;
+
+  Object.keys(reg).forEach(id => {
+    const entrada = reg[id];
+    if (!entrada) return;
+
+    const numEntrada = String(
+      entrada.numero || _extraerNumeroDePath(entrada.path) || ''
+    ).trim();
+
+    if (numEntrada !== num) return;
+    if (entrada.estado === 'rectificada') return;  // ya está marcada, no tocar
+
+    entrada.estado = 'rectificada';
+    entrada.ts = ahora;
+    entrada.detalle = (entrada.detalle || '') +
+      '  ||  Rectificada manualmente desde el modal (' + ahora + ')';
+    if (!entrada.numero) entrada.numero = num;
+
+    actualizadas++;
+  });
+
+  if (actualizadas > 0) guardarRegistroPDFs(reg);
+  return { actualizadas };
+}
+
+function _diffFacturaPDF(facturaExistente, campos) {
+  const diffs = [];
+  const _fmtNum = (n) => {
+    const num = Number(n);
+    if (!isFinite(num) || num === 0) return '0';
+    return Math.round(num).toLocaleString('es-CL');
+  };
+  function _pushDif(a, b, esNum, label) {
+    const aa = esNum ? (Number(a) || 0) : String(a == null ? '' : a).trim();
+    const bb = esNum ? (Number(b) || 0) : String(b == null ? '' : b).trim();
+    if (aa === bb) return;
+    const aaTxt = esNum ? _fmtNum(aa) : (aa || '—');
+    const bbTxt = esNum ? _fmtNum(bb) : (bb || '—');
+    diffs.push('   · ' + label + ':  ' + aaTxt + '  →  ' + bbTxt);
+  }
+  _pushDif(facturaExistente.codigo, campos.fCodigo, false, 'Código cliente');
+  _pushDif(facturaExistente.periodo, campos.fPeriodo, false, 'Período');
+  _pushDif(facturaExistente.tipo, campos.fTipo, false, 'Tipo');
+  _pushDif(facturaExistente.fechaEmision, campos.fEmision, false, 'F. Emisión');
+  _pushDif(facturaExistente.fechaVencimiento, campos.fVencimiento, false, 'F. Vencimiento');
+  _pushDif(facturaExistente.kwh, campos.fKwh, true, 'kWh');
+  _pushDif(facturaExistente.sum, campos.fSum, true, 'Suministro Neto');
+  _pushDif(facturaExistente.peaje, campos.fPeaje, true, 'Peaje');
+  _pushDif(facturaExistente.intereses, campos.fInt, true, 'Int. Sum.');
+  _pushDif(facturaExistente.intPeaje, campos.fIntPeaje, true, 'Int. Peaje');
+  _pushDif(facturaExistente.otros, campos.fOtros, true, 'Otros Sum.');
+  _pushDif(facturaExistente.otrosPeaje, campos.fOtrosPeaje, true, 'Otros Peaje');
+  _pushDif(facturaExistente.total, campos.fTotal, true, 'Total');
+  return diffs;
+}
+
+function _procesarUnPDF(item, existentes, config, copiarADestinos, opciones) {
+  _diagReset(item.path);
+  const r = _procesarUnPDF_interno(item, existentes, config, copiarADestinos, opciones);
+  r.diag = _DIAG_INTENTOS.map(it =>
+    '[' + it.fuente + '] ' + (it.ok ? 'OK' : 'FALLO(' + (it.error || '') + ')')
+  ).join(' | ');
+  return r;
+}
+
+function _procesarUnPDF_interno(item, existentes, config, copiarADestinos, opciones) {
+  opciones = opciones || {};
+  const file = item.file;
+
+  // 1) Obtener base64
+  let base64, mime;
+  try {
+    const blob = file.getBlob();
+    base64 = Utilities.base64Encode(blob.getBytes());
+    mime = blob.getContentType() || 'application/pdf';
+  } catch (e) {
+    return { estado: 'error_ocr', detalle: 'Lectura falló: ' + e.message };
+  }
+
+  // 2) Cascada: Drive OCR → OCR.space → Gemini
+  let campos = null;
+  let motorUsado = '';
+  let mejorScore = -1;
+  let mejorCampos = null;
+  let mejorMotor = '';
+
+  const _evaluar = (motor, c, chars, preview) => {
+    _diagIntentar(motor, true, { campos: c, chars, preview });
+    const det = _contarCamposDetectadosBack(c);
+    if (det.total > mejorScore) {
+      mejorScore = det.total;
+      mejorCampos = c;
+      mejorMotor = motor;
+    }
+    return _camposSonUtilizables(c);
+  };
+
+  // 2.1) Drive OCR — sólo si no está bloqueado por cuota
+  if (_driveOcrEstaBloqueado()) {
+    _diagIntentar('Drive OCR', false, { error: 'Cuota agotada (saltado)' });
+  } else {
+    const r1 = _extraerConDriveOCR(file.getName(), base64, mime);
+    if (r1.ok && r1.texto) {
+      const c1 = _parsearFacturaCompleta(r1.texto);
+      if (_evaluar('Drive OCR', c1, r1.texto.length, r1.texto)) {
+        campos = c1; motorUsado = 'Drive OCR';
+        _diagReporteFinal(campos, motorUsado, true);
+        return _finalizarProcesamientoPDF(item, campos, motorUsado, existentes, config, copiarADestinos, opciones);
+      }
+    } else {
+      _diagIntentar('Drive OCR', false, { error: r1.error });
+    }
+  }
+
+  // 2.2) OCR.space
+  const r2 = _extraerConOCRSpace(file.getName(), base64, mime);
+  if (r2.ok && r2.texto) {
+    const c2 = _parsearFacturaCompleta(r2.texto);
+    if (_evaluar('OCR.space', c2, r2.texto.length, r2.texto)) {
+      campos = c2; motorUsado = 'OCR.space';
+      _diagReporteFinal(campos, motorUsado, true);
+      return _finalizarProcesamientoPDF(item, campos, motorUsado, existentes, config, copiarADestinos, opciones);
+    }
+  } else {
+    _diagIntentar('OCR.space', false, { error: r2.error });
+  }
+
+  // 2.3) Gemini — ÚLTIMO RECURSO
+  if (GEMINI_API_KEY && String(GEMINI_API_KEY).trim()) {
+    const g = _extraerConGemini(base64, mime, file.getName());
+    if (g.ok && g.campos) {
+      if (_evaluar('Gemini (último recurso)', g.campos, 0, '')) {
+        campos = g.campos; motorUsado = 'Gemini (último recurso)';
+        _diagReporteFinal(campos, motorUsado, true);
+        return _finalizarProcesamientoPDF(item, campos, motorUsado, existentes, config, copiarADestinos, opciones);
+      }
+    } else {
+      _diagIntentar('Gemini (último recurso)', false, { error: g.error });
+    }
+  } else {
+    _diagIntentar('Gemini', false, { error: 'No configurado' });
+  }
+
+  // 3) Ningún resultado utilizable → usar el mejor parcial
+  _diagReporteFinal(mejorCampos, mejorMotor || '(ninguna)', false);
+
+  if (!mejorCampos) {
+    return { estado: 'error_ocr', detalle: 'Ninguna fuente pudo extraer campos' };
+  }
+
+  if (!mejorCampos.fNumero) {
+    return { estado: 'error_parseo', detalle: 'No se detectó N° factura [mejor fuente: ' + mejorMotor + ']' };
+  }
+  if (!mejorCampos.fCodigo) {
+    return { estado: 'error_parseo', detalle: 'No se detectó código de cliente [mejor fuente: ' + mejorMotor + ']' };
+  }
+  if (!mejorCampos.fPeriodo) {
+    return { estado: 'error_parseo', detalle: 'No se detectó período' };
+  }
+
+  return _finalizarProcesamientoPDF(item, mejorCampos, mejorMotor, existentes, config, copiarADestinos, opciones);
+}
+
+
+/**
+ * Copia el PDF a los destinos del centro (Operaciones + Comunidad)
+ * con el nombre estándar y vincula el archivo resultante a la factura.
+ *
+ * @returns {{ ok:boolean, idFinal:string, warning:string }}
+ */
+function _copiarYVincularPDF(file, numero, codigo, periodo, tipo, centro) {
+  const nombreEst = _construirNombreArchivoEstandar({
+    numero:  numero,
+    codigo:  codigo,
+    periodo: periodo,
+    tipo:    tipo
+  }, centro);
+
+  let idFinal = '';
+  let warning = '';
+
+  if (!(centro.driveOp || centro.driveCom)) {
+    return { ok: true, idFinal: '', warning: '' };   // nada que hacer
+  }
+
+  try {
+    const copia = copiarPDFDriveADestinos(file.getId(), centro.codigo, nombreEst);
+    if (copia.ok && copia.archivos && copia.archivos.length) {
+      idFinal = copia.archivos[0].id;
+      const vinc = vincularPDFDrive(numero, idFinal, nombreEst);
+      if (!vinc.ok && vinc.error) {
+        warning = 'PDF copiado pero no vinculado: ' + vinc.error;
+      }
+    } else if (!copia.ok) {
+      warning = 'PDF no copiado: ' + (copia.error || 'sin detalle');
+    }
+  } catch (e) {
+    warning = 'PDF no copiado: ' + e.message;
+  }
+
+  return { ok: !warning, idFinal, warning };
+}
+/**
+ * Aplica los campos extraídos al proceso masivo (crear/rectificar factura).
+ */
+function _finalizarProcesamientoPDF(item, campos, motorUsado, existentes, config, copiarADestinos, opciones) {
+  const file = item.file;
+  const _normCod = (s) => String(s || '').trim().replace(/[\.\s\-]/g, '').toUpperCase();
+  const codBuscado = _normCod(campos.fCodigo);
+
+  const centro = codBuscado
+    ? config.centros.find(c => _normCod(c.codigo) === codBuscado)
+    : null;
+
+  let warningCentro = '';
+  if (!centro) {
+    const esRutAciertaCod = /^\d{7,8}-[\dKk]$/.test(String(campos.fCodigo || ''));
+    const tempCentro = config.centros.find(c => _esCentroFantasmaBack(c.codigo, c.cliente));
+    if (!tempCentro) {
+      return { estado: 'error_centro', detalle: 'Centro no encontrado y no hay centro "Sin asignar": ' + campos.fCodigo };
+    }
+    warningCentro = esRutAciertaCod
+      ? 'RUT cliente Acierta "' + campos.fCodigo + '" no está en Config → agrégalo. Asignado a Sin asignar.'
+      : 'Código "' + (campos.fCodigo || '—') + '" no reconocido → asignado a Sin asignar.';
+  }
+  const centroFinal = centro || config.centros.find(c => _esCentroFantasmaBack(c.codigo, c.cliente));
+
+  let warningRut = '';
+  if (campos.fRut && !_esRutEmoac(campos.fRut) && !centroFinal.rut) {
+    try {
+      const rRut = guardarRutCentroConfig(centroFinal.codigo, campos.fRut);
+      if (rRut.ok && rRut.guardado) centroFinal.rut = rRut.rut;
+      else if (!rRut.ok) warningRut = 'RUT no guardado: ' + rRut.error;
+    } catch (e) { warningRut = 'RUT no guardado: ' + e.message; }
+  }
+
+  const tipo = (campos.fTipo || 'SUMINISTRO').toUpperCase();
+  const esTemporal = _esCentroFantasmaBack(centroFinal.codigo, centroFinal.cliente);
+
+  const dup = existentes.find(f => String(f.numero).trim() === String(campos.fNumero).trim());
+
+  if (dup) {
+    const info = obtenerInfoFactura(String(campos.fNumero).trim(), tipo);
+    if (info.ok && info.pdfId) {
+      let pagExist = 0;
+      try { pagExist = _contarPaginasPdf(info.pdfId); } catch (e) { }
+      _registrarPDFEnDup(opciones.dupRegistro, campos.fNumero, tipo, info.pdfId, '(vinculado en la BD)', pagExist);
+    }
+    let pagNuevo = 0;
+    try { pagNuevo = _contarPaginasPdf(file); } catch (e) { }
+    let idNuevo = '';
+    try { idNuevo = file.getId(); } catch (e) { }
+    _registrarPDFEnDup(opciones.dupRegistro, campos.fNumero, tipo, idNuevo, item.path, pagNuevo);
+
+    if (!opciones.reprocesarRecientes && info.ok && info.procesadoMasivo) {
+      const edadMs = Date.now() - info.procesadoMasivo.getTime();
+      const UN_DIA_MS = 24 * 60 * 60 * 1000;
+      if (edadMs < UN_DIA_MS) return { estado: 'duplicada', detalle: '', warning: 'Omitida: procesada <1 día' };
+    }
+
+    const paginasNuevo = _contarPaginasPdf(file);
+    const pdfIdActual = info.ok ? info.pdfId : '';
+    const paginasActual = pdfIdActual ? _contarPaginasPdf(pdfIdActual) : 0;
+    let reemplazar = false;
+    if (!pdfIdActual) reemplazar = true;
+    else if (paginasNuevo > paginasActual) reemplazar = true;
+
+    // Si hay que reemplazar el PDF: copiarlo a los destinos con el nombre
+    // estándar y quedarnos con el ID nuevo. Misma lógica que al crear.
+    let idDriveFinal = '';
+    if (reemplazar && copiarADestinos) {
+      const rCop = _copiarYVincularPDF(
+        file, campos.fNumero, centroFinal.codigo, campos.fPeriodo, tipo, centroFinal
+      );
+      if (rCop.idFinal) idDriveFinal = rCop.idFinal;
+      // El warning se propaga al warningFinal (abajo).
+      if (rCop.warning) warningCentro += ' · ' + rCop.warning;
+    }
+
+    let rRect = { ok: false };
+    try {
+      rRect = actualizarFacturaDesdePDF({
+        numero: String(campos.fNumero).trim(),
+        tipo: tipo,
+        cliente: esTemporal ? '' : centroFinal.cliente,
+        codigo:  esTemporal ? '' : centroFinal.codigo,
+        periodo: campos.fPeriodo || '',
+        kwh: campos.fKwh, sum: campos.fSum, peaje: campos.fPeaje,
+        intereses: campos.fInt, intPeaje: campos.fIntPeaje,
+        otros: campos.fOtros, otrosPeaje: campos.fOtrosPeaje,
+        total: campos.fTotal,
+        fechaEmision: campos.fEmision, fechaVencimiento: campos.fVencimiento,
+        // ⚠ La fecha de recepción NO se infiere del PDF ni del momento
+        //   del procesamiento: debe quedar vacía para que el usuario la
+        //   registre manualmente desde el modal o al hacer click en la
+        //   celda del Seguimiento.
+        fechaConsumo: '', fechaPeaje: ''
+      }, idDriveFinal, new Date());
+    } catch (e) { return { estado: 'error_otro', detalle: 'Rectificar: ' + e.message }; }
+    if (!rRect.ok) return { estado: 'error_otro', detalle: 'Rectificar: ' + rRect.error };
+
+    const diffs = _diffFacturaPDF(dup, campos);
+    let msgPag = reemplazar
+      ? (pdfIdActual ? 'Reemplazado (' + paginasNuevo + '>' + paginasActual + ')' : 'Vinculado (' + paginasNuevo + ')')
+      : 'Rectificada';
+    const warningFinal = msgPag + ' · Motor: ' + motorUsado;
+
+    if (diffs.length) return { estado: 'rev_manual', detalle: 'Diferencias:\n' + diffs.join('\n'), warning: warningFinal };
+    return { estado: 'rectificada', detalle: '', warning: warningFinal };
+  }
+
+  // Crear factura nueva
+  const datos = {
+    numero: String(campos.fNumero).trim(),
+    codigo: centroFinal.codigo,
+    cliente: centroFinal.cliente,
+    periodo: campos.fPeriodo,
+    tipo: tipo,
+    // ⚠ La fecha de recepción NO se infiere del PDF ni del momento del
+    //   procesamiento masivo. Se deja en blanco para que el usuario la
+    //   registre manualmente al hacer click en la celda del Seguimiento.
+    fecha: '',
+    fechaConsumo: '',
+    fechaPeaje: '',
+    fechaEmision: campos.fEmision || '',
+    fechaVencimiento: campos.fVencimiento || '',
+    kwh: campos.fKwh || 0, sum: campos.fSum || 0, peaje: campos.fPeaje || 0,
+    intereses: campos.fInt || 0, intPeaje: campos.fIntPeaje || 0,
+    otros: campos.fOtros || 0, otrosPeaje: campos.fOtrosPeaje || 0,
+    total: campos.fTotal || 0,
+    pdfDriveUrl: '',
+    procesadoMasivo: true
+  };
+
+  try { agregarFacturaFront(datos); }
+  catch (e) { return { estado: 'error_otro', detalle: 'Al guardar: ' + e.message }; }
+
+  // ─── Copiar el PDF a los destinos del centro y vincularlo a la
+  //     factura recién creada. Se usa la MISMA función que en la rama
+  //     "duplicada": _construirNombreArchivoEstandar → nombre único.
+  let warning = '';
+  if (copiarADestinos && (centroFinal.driveOp || centroFinal.driveCom)) {
+    const nombreEst = _construirNombreArchivoEstandar(campos, centroFinal);
+    try {
+      const copia = copiarPDFDriveADestinos(file.getId(), centroFinal.codigo, nombreEst);
+      if (copia.ok && copia.archivos && copia.archivos.length) {
+        const idCopia = copia.archivos[0].id;
+        // Vincular el ID copiado a la factura (queda en la columna PDF_ID).
+        const vinc = vincularPDFDrive(campos.fNumero, idCopia, nombreEst);
+        if (!vinc.ok && vinc.error) {
+          warning = 'Factura creada; PDF copiado pero no vinculado: ' + vinc.error;
+        }
+      } else if (!copia.ok) {
+        warning = 'Factura creada, PDF no copiado: ' + (copia.error || 'sin detalle');
+      }
+    } catch (e) {
+      warning = 'Factura creada, PDF no copiado: ' + e.message;
+    }
+  }
+
+  let pagRecienCreado = 0;
+  try { pagRecienCreado = _contarPaginasPdf(file); } catch (e) { }
+  let idRecienCreado = '';
+  try { idRecienCreado = file.getId(); } catch (e) { }
+  _registrarPDFEnDup(opciones.dupRegistro, campos.fNumero, tipo, idRecienCreado, item.path, pagRecienCreado);
+
+  existentes.push({ numero: campos.fNumero, cliente: centroFinal.cliente, periodo: campos.fPeriodo, tipo: tipo });
+
+  const warningsFinales = [warningCentro, warning, warningRut].filter(Boolean).join(' · ');
+  return { estado: 'ok', detalle: '', warning: warningsFinales, numeroFactura: String(campos.fNumero || '').trim() };
+}
+
+function _listarPDFsRecursivo(folder, acc, path) {
+  const pathActual = path ? path + '/' + folder.getName() : folder.getName();
+  const files = folder.getFiles();
+  while (files.hasNext()) {
+    const f = files.next();
+    if (f.getMimeType() === MimeType.PDF || /\.pdf$/i.test(f.getName())) {
+      acc.push({ file: f, path: pathActual + '/' + f.getName() });
+    }
+  }
+  const subs = folder.getFolders();
+  while (subs.hasNext()) _listarPDFsRecursivo(subs.next(), acc, pathActual);
+}
+
+// ============================================================
+//  Cuenta páginas de un PDF
+// ============================================================
+function _contarPaginasPdf(idOrFile) {
+  try {
+    const file = (typeof idOrFile === 'string') ? DriveApp.getFileById(idOrFile) : idOrFile;
+    const blob = file.getBlob();
+    const bytes = blob.getBytes();
+    const s = Utilities.newBlob(bytes).getDataAsString('ISO-8859-1');
+    const countMatch = s.match(/\/Count\s+(\d+)/);
+    if (countMatch) { const n = parseInt(countMatch[1], 10); if (n > 0) return n; }
+    const m1 = s.match(/\/Type\s*\/Page(?!s)/g);
+    if (m1) return m1.length;
+    return 0;
+  } catch (e) { Logger.log('_contarPaginasPdf error: ' + e.message); return 0; }
+}
+
+// ============================================================
+//  SETTERS genéricos
+// ============================================================
+function _setCeldaNum(sh, fila, col, val) {
+  if (val === undefined || val === null || val === '') return false;
+  const n = Number(val);
+  if (!isFinite(n) || n <= 0) return false;
+  sh.getRange(fila, col).setValue(n);
+  return true;
+}
+function _setCeldaFecha(sh, fila, col, iso) {
+  if (!iso) return false;
+  const s = String(iso).trim();
+  const c = sh.getRange(fila, col);
+  if (SENTINELAS.indexOf(s) !== -1) {
+    c.setNumberFormat('@');
+    c.setValue(s);
+    return true;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const p = s.split('-').map(Number);
+  c.setNumberFormat('dd/mm/yyyy');
+  c.setValue(new Date(p[0], p[1] - 1, p[2]));
+  return true;
+}
+function _setCeldaTexto(sh, fila, col, val) {
+  if (val === undefined || val === null) return false;
+  const s = String(val).trim();
+  if (!s) return false;
+  sh.getRange(fila, col).setValue(s).setNumberFormat('@');
+  return true;
+}
+
+// ============================================================
+//  MIGRACIÓN — eliminar físicamente la columna "Empalme"
+//  Ejecutar UNA VEZ desde el menú ⚡ Funciones adicionales.
+//  Después de correrla, la columna C (Empalme) desaparece y las
+//  columnas a la derecha se recorren automáticamente.
+// ============================================================
+
+
+/**
+ * Convierte a Date las fechas que estén guardadas como texto en
+ * la hoja "Resumen Facturación" (F.Recep Consumo, F.Recep Peaje,
+ * F.Emisión, F.Venc). Ejecutar UNA VEZ.
+ */
+function convertirFechasTextoADate() {
+  const ui = SpreadsheetApp.getUi();
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  if (!sh) { ui.alert('No existe la hoja ' + HOJA_RESUMEN); return; }
+  const lr = sh.getLastRow();
+  if (lr < 2) { ui.alert('Sin datos.'); return; }
+
+  const cols = [COL.FECHA_SUMINISTRO, COL.FECHA_PEAJE, COL.FECHA_EMISION, COL.FECHA_VENC];
+  let convertidas = 0;
+
+  cols.forEach(col => {
+    const rango = sh.getRange(2, col, lr - 1, 1);
+    const vals = rango.getValues();
+    let cambio = false;
+    const nuevos = vals.map(r => {
+      const v = r[0];
+      if (v instanceof Date) return [v];
+      if (v === null || v === undefined || v === '') return [v];
+      const s = String(v).trim();
+      if (SENTINELAS.indexOf(s) !== -1) return [v];
+      let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+      if (m) { cambio = true; convertidas++; return [new Date(+m[1], +m[2]-1, +m[3])]; }
+      m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+      if (m) { cambio = true; convertidas++; return [new Date(+m[3], +m[2]-1, +m[1])]; }
+      return [v];
+    });
+    if (cambio) {
+      rango.setNumberFormat('dd/mm/yyyy');
+      rango.setValues(nuevos);
+    }
+  });
+
+  Logger.log('✓ Fechas convertidas a Date: ' + convertidas);
+  ui.alert('✓ Conversión completada.\n\nFechas convertidas: ' + convertidas);
+}
+
+/**
+ * Consolida en UNA sola fila el centro "Sin asignar":
+ *   · Renombra todas las facturas del Resumen que apunten a
+ *     variantes previas (TEMP, ⚠️ Sin asignar) al nuevo formato
+ *     "Sin asignar" / "Sin código".
+ *   · Deja en Config una única fila fantasma.
+ *
+ * Ejecutar UNA VEZ desde el menú ⚡ Funciones adicionales.
+ */
+function consolidarCentroSinAsignar() {
+  const ui = SpreadsheetApp.getUi();
+  const ok = ui.alert(
+    '🧹 Consolidar centro "Sin asignar"',
+    'Se unificarán las variantes TEMP / ⚠️ Sin asignar en una sola:\n\n' +
+    '  Centro: "Sin asignar"  ·  Código: "Sin código"\n\n' +
+    'Se actualizarán las facturas del Resumen y la hoja Config.\n\n¿Continuar?',
+    ui.ButtonSet.YES_NO
+  );
+  if (ok !== ui.Button.YES) return;
+
+  const CODIGO_NUEVO  = 'Sin código';
+  const CLIENTE_NUEVO = 'Sin asignar';
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const shResumen = ss.getSheetByName(HOJA_RESUMEN);
+  const shConfig  = ss.getSheetByName(HOJA_CONFIG);
+
+  let facturasActualizadas = 0;
+  let filasConfigBorradas  = 0;
+
+  // 1) Normalizar facturas
+  if (shResumen) {
+    const lr = shResumen.getLastRow();
+    if (lr >= 2) {
+      const data = shResumen.getRange(2, 1, lr - 1, COL.CLIENTE).getValues();
+      for (let i = 0; i < data.length; i++) {
+        const cliente = String(data[i][COL.CLIENTE - 1] || '').trim();
+        const codigo  = String(data[i][COL.CODIGO  - 1] || '').trim();
+        if (!_esCentroFantasmaBack(codigo, cliente)) continue;
+        let cambio = false;
+        if (cliente !== CLIENTE_NUEVO) {
+          shResumen.getRange(i + 2, COL.CLIENTE).setValue(CLIENTE_NUEVO);
+          cambio = true;
+        }
+        if (codigo !== CODIGO_NUEVO) {
+          shResumen.getRange(i + 2, COL.CODIGO).setValue(CODIGO_NUEVO).setNumberFormat('@');
+          cambio = true;
+        }
+        if (cambio) facturasActualizadas++;
+      }
+    }
+  }
+
+  // 2) Normalizar Config (dejar sólo una fila fantasma)
+  if (shConfig) {
+    const lrC = Math.max(shConfig.getLastRow(), 1);
+    const filasGhost = [];
+    if (lrC >= 2) {
+      const vals = shConfig.getRange(2, 2, lrC - 1, 9).getValues();
+      for (let i = 0; i < vals.length; i++) {
+        const codigo  = String(vals[i][1] || '').trim();
+        const cliente = String(vals[i][2] || '').trim();
+        if (_esCentroFantasmaBack(codigo, cliente)) filasGhost.push(i + 2);
+      }
+    }
+    filasGhost.sort((a, b) => b - a).forEach(fila => {
+      shConfig.deleteRow(fila);
+      filasConfigBorradas++;
+    });
+    _asegurarColumnaEmpresa(shConfig);
+    const nextRow = Math.max(shConfig.getLastRow(), 1) + 1;
+    shConfig.getRange(nextRow, 2, 1, 9).setValues([[
+      '', CODIGO_NUEVO, CLIENTE_NUEVO, '', '', '', '', '', 'EMOAC'
+    ]]);
+    _configCache = null;
+  }
+
+  refrescarSeguimiento();
+  ui.alert(
+    '✓ Consolidación completada.\n\n' +
+    '· Facturas actualizadas: ' + facturasActualizadas + '\n' +
+    '· Filas Config borradas: ' + filasConfigBorradas + '\n\n' +
+    'Se dejó una única fila "Sin asignar" / "Sin código".'
+  );
+}
+// ============================================================
+//  NOMBRE ESTÁNDAR DE PDF — FUENTE ÚNICA DE VERDAD
+//  Formato: Periodo_Código_N°Factura_CentroDeCosto_Tipo.pdf
+//
+//  Acepta un objeto con cualquiera de estas claves (prioriza las
+//  que vienen del parser, con fallback a las del modal):
+//    · numero / fNumero
+//    · codigo / fCodigo
+//    · periodo / fPeriodo
+//    · tipo / fTipo
+//
+//  El nombre del centro se resuelve por código desde `leerConfig()`,
+//  así no depende del DOM ni del option seleccionado.
+// ============================================================
+function _construirNombreArchivoEstandar(datos, centro) {
+  const d = datos || {};
+
+  const codigo  = String(d.codigo  != null ? d.codigo  : (d.fCodigo  || '')).trim();
+  const numero  = String(d.numero  != null ? d.numero  : (d.fNumero  || '')).trim() || 'sin-numero';
+  const periodo = String(d.periodo != null ? d.periodo : (d.fPeriodo || '')).trim() || 'sin-periodo';
+  const tipoRaw = String(d.tipo    != null ? d.tipo    : (d.fTipo    || '')).trim().toUpperCase();
+
+  let etiquetaTipo = tipoRaw;
+  if (tipoRaw === 'CONSUMO')          etiquetaTipo = 'Suministro';
+  else if (tipoRaw === 'PEAJE')       etiquetaTipo = 'Peaje';
+  else if (tipoRaw === 'UNIFICADA')   etiquetaTipo = 'Unificada';
+  else if (tipoRaw === 'ARRIENDO_MEDIDOR') etiquetaTipo = 'ArriendoMedidor';
+
+  // El centro puede venir por parámetro (evita lookup) o resolverse
+  // por código contra Config.
+  let centroNombre = '';
+  if (centro && String(centro.codigo || '').trim() === codigo) {
+    centroNombre = String(centro.cliente || '').trim();
+  } else if (codigo) {
+    const cfg = leerConfig();
+    const c = cfg.centros.find(x => String(x.codigo || '').trim() === codigo);
+    if (c) centroNombre = String(c.cliente || '').trim();
+    // Si no se encontró con el cache actual, forzar relectura y
+    // reintentar antes de caer a "sin-centro".
+    if (!centroNombre) {
+      _invalidarConfigCache();
+      const cfg2 = leerConfig();
+      const c2 = cfg2.centros.find(x => String(x.codigo || '').trim() === codigo);
+      if (c2) centroNombre = String(c2.cliente || '').trim();
+    }
+  }
+
+  const codigoSafe = codigo || 'sin-codigo';
+  const centroSafe = centroNombre
+    ? centroNombre.replace(/[\/\\:*?"<>|]/g, '-')
+    : 'sin-centro';
+  const tipoSafe   = etiquetaTipo || 'X';
+
+  return periodo + '_' + codigoSafe + '_' + numero + '_' + centroSafe + '_' + tipoSafe + '.pdf';
+}
+
+
+/**
+ * Migra la base de datos y las hojas del libro desde la
+ * nomenclatura antigua "Consumo" a "Suministro":
+ *   · Renombra la hoja "Consumo" → "Suministro".
+ *   · Cambia el valor tipo='CONSUMO' → 'SUMINISTRO' en el Resumen.
+ *
+ * Ejecutar UNA VEZ desde ⚡ Funciones adicionales.
+ */
+function migrarConsumoASuministro() {
+  const ui = SpreadsheetApp.getUi();
+  const ok = ui.alert(
+    '🔁 Migrar "Consumo" → "Suministro"',
+    'Este proceso:\n\n' +
+    '  1. Renombra la hoja "Consumo" → "Suministro".\n' +
+    '  2. Cambia el valor de la columna Tipo de "CONSUMO" a "SUMINISTRO"\n' +
+    '     en todas las filas del Resumen.\n\n' +
+    'Es idempotente (se puede correr varias veces sin daño).\n\n¿Continuar?',
+    ui.ButtonSet.YES_NO
+  );
+  if (ok !== ui.Button.YES) return;
+
+  const ss = SpreadsheetApp.openById(SS_ID);
+
+  // ─── 1) Renombrar la hoja Consumo → Suministro ───
+  let hojaRenombrada = false;
+  const shViejo = ss.getSheetByName('Consumo');
+  const shNuevo = ss.getSheetByName('Suministro');
+  if (shViejo && !shNuevo) {
+    shViejo.setName('Suministro');
+    hojaRenombrada = true;
+  }
+
+  // ─── 2) Migrar el valor tipo='CONSUMO' → 'SUMINISTRO' ───
+  let filasMigradas = 0;
+  const sh = ss.getSheetByName(HOJA_RESUMEN);
+  if (sh) {
+    const lr = sh.getLastRow();
+    if (lr >= 2) {
+      const rango = sh.getRange(2, COL.TIPO, lr - 1, 1);
+      const vals = rango.getValues();
+      let cambio = false;
+      const nuevos = vals.map(r => {
+        if (String(r[0] || '').trim().toUpperCase() === 'CONSUMO') {
+          cambio = true; filasMigradas++;
+          return ['SUMINISTRO'];
+        }
+        return [r[0]];
+      });
+      if (cambio) rango.setValues(nuevos);
+    }
+  }
+
+  refrescarSeguimiento();
+  ui.alert(
+    '✓ Migración completada.\n\n' +
+    '· Hoja renombrada: ' + (hojaRenombrada ? 'sí (Consumo → Suministro)' : 'no (ya estaba o no existía)') + '\n' +
+    '· Facturas migradas a "SUMINISTRO": ' + filasMigradas
+  );
+}
+
+// ============================================================
+//  RENOMBRADO MASIVO DE PDFs VINCULADOS
+//  (usa `_construirNombreArchivoEstandar` definido justo arriba —
+//   fuente única de verdad del nombre estándar)
+// ============================================================
+
+/**
+ * Recorre todas las filas con PDF_ID y renombra los archivos en Drive
+ * al formato estándar.
+ *
+ *   · Si el archivo ya tiene el nombre correcto → no se toca.
+ *   · Si el ID está en papelera o es inaccesible → busca en los Drives
+ *     del centro un archivo cuyo nombre contenga el N° de factura y
+ *     reemplaza el ID en la BD con el encontrado.
+ *   · Si la auto-búsqueda falla → pide el ID manualmente por `ui.prompt`.
+ *
+ * Invocable desde el menú ⚡ Funciones adicionales.
+ */
+function renombrarTodosLosPDFs() {
+  const ui = SpreadsheetApp.getUi();
+
+  const confirmar = ui.alert(
+    '📝 Renombrar PDFs vinculados',
+    'Se recorrerán TODAS las filas con PDF_ID en "Resumen Facturación"\n' +
+    'y se renombrará cada archivo en Drive al formato:\n\n' +
+    '  Periodo_Código_N°Factura_CentroDeCosto_Tipo.pdf\n\n' +
+    'Comportamiento:\n' +
+    '  · Si el archivo ya tiene el nombre correcto → no se toca.\n' +
+    '  · Si el ID está en papelera o es inaccesible, se busca\n' +
+    '    automáticamente en los Drives del centro un archivo cuyo nombre\n' +
+    '    contenga el N° de factura y se usa ese ID.\n' +
+    '  · Si la auto-búsqueda no encuentra nada, se pide el ID manualmente.\n\n' +
+    '¿Continuar?',
+    ui.ButtonSet.YES_NO
+  );
+  if (confirmar !== ui.Button.YES) return;
+
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const sh = ss.getSheetByName(HOJA_RESUMEN);
+  if (!sh) { ui.alert('No existe la hoja "Resumen Facturación".'); return; }
+
+  const lr = Math.max(sh.getLastRow(), 1);
+  if (lr < 2) { ui.alert('No hay facturas.'); return; }
+
+  const nCols = Math.max(sh.getLastColumn(), COL.PDF_ID);
+  const data  = sh.getRange(2, 1, lr - 1, nCols).getValues();
+
+  let renombrados     = 0;
+  let sinCambio       = 0;
+  let sinPDF          = 0;
+  let autoRecuperados = 0;
+  let reemplazados    = 0;
+  let pospuestos      = 0;
+  const problemas     = [];   // filas sin resolver (se preguntan después)
+  const errores       = [];   // errores inesperados
+
+  for (let i = 0; i < data.length; i++) {
+    const fila    = data[i];
+    const numero  = String(fila[COL.NUMERO - 1] || '').trim();
+    const codigo  = String(fila[COL.CODIGO - 1] || '').trim();
+    const periodo = String(fila[COL.PERIODO - 1] || '').trim();
+    const tipo    = String(fila[COL.TIPO - 1] || '').trim();
+    const pdfId   = String(fila[COL.PDF_ID - 1] || '').trim();
+
+    if (!pdfId) { sinPDF++; continue; }
+    if (!numero) { sinPDF++; continue; }
+
+    const nombreNuevo = _construirNombreArchivoEstandar({ numero, codigo, periodo, tipo });
+
+    // ─── 1) Intentar acceder al archivo actual ───
+    let file = null;
+    let motivoProblema = '';
+    try {
+      file = DriveApp.getFileById(pdfId);
+      let trashed = false;
+      try { trashed = file.isTrashed(); } catch (e) {}
+      if (trashed) { file = null; motivoProblema = 'En papelera'; }
+    } catch (e) {
+      file = null;
+      motivoProblema = 'Inaccesible: ' + (e.message || e);
+    }
+
+    // ─── 2) Auto-búsqueda en el Drive del centro ───
+    if (!file) {
+      const busqueda = _buscarPDFEnDriveDelCentro(codigo, numero);
+      if (busqueda.ok && busqueda.encontrado) {
+        const rRep = reemplazarPDFFactura(numero, busqueda.id);
+        if (rRep.ok) {
+          autoRecuperados++;
+          try { file = DriveApp.getFileById(busqueda.id); } catch (e) { file = null; }
+          Logger.log('[auto-recuperado] N° ' + numero + '  →  ' + busqueda.id +
+                     '  (' + busqueda.carpeta + ': ' + busqueda.nombre + ')');
+        } else {
+          motivoProblema += ' · No se pudo guardar el ID nuevo: ' + rRep.error;
+        }
+      } else {
+        motivoProblema += ' · Auto-búsqueda: ' + (busqueda.error || 'sin resultado');
+      }
+    }
+
+    // ─── 3) Si sigue sin archivo, registrar para preguntar después ───
+    if (!file) {
+      problemas.push({
+        fila: i + 2, numero, codigo, pdfId, nombreNuevo,
+        motivo: motivoProblema || 'No se pudo acceder al archivo'
+      });
+      continue;
+    }
+
+    // ─── 4) Renombrar si corresponde ───
+    try {
+      const nombreActual = file.getName();
+      if (nombreActual === nombreNuevo) { sinCambio++; continue; }
+      file.setName(nombreNuevo);
+      renombrados++;
+    } catch (e) {
+      problemas.push({
+        fila: i + 2, numero, codigo, pdfId, nombreNuevo,
+        motivo: 'Renombrado falló: ' + (e.message || e)
+      });
+    }
+  }
+
+  // ─── 5) Pregunta manual sólo para lo que quedó sin resolver ───
+  if (problemas.length) {
+    const quiereManual = ui.alert(
+      '⚠️ ' + problemas.length + ' PDFs requieren atención',
+      'La auto-búsqueda en el Drive del centro no encontró el archivo para:\n\n' +
+      problemas.slice(0, 10).map(p =>
+        '· Fila ' + p.fila + '  N° ' + p.numero + '  —  ' + p.motivo
+      ).join('\n') +
+      (problemas.length > 10 ? '\n  … y ' + (problemas.length - 10) + ' más' : '') +
+      '\n\n¿Querés ingresar manualmente un ID/URL por cada uno?',
+      ui.ButtonSet.YES_NO
+    );
+
+    if (quiereManual === ui.Button.YES) {
+      problemas.forEach(p => {
+        const resp = ui.prompt(
+          'Reemplazar PDF · Fila ' + p.fila + '  N° ' + p.numero,
+          p.motivo + '\n\n' +
+          'Nombre esperado:\n  ' + p.nombreNuevo + '\n\n' +
+          'ID actual en la BD:\n  ' + p.pdfId + '\n\n' +
+          'Pegá el ID o URL del archivo nuevo (dejá vacío para saltar):',
+          ui.ButtonSet.OK_CANCEL
+        );
+        if (resp.getSelectedButton() !== ui.Button.OK) { pospuestos++; return; }
+        const nuevoId = String(resp.getResponseText() || '').trim();
+        if (!nuevoId) { pospuestos++; return; }
+
+        const r = reemplazarPDFFactura(p.numero, nuevoId);
+        if (r.ok) {
+          reemplazados++;
+          try {
+            const f2 = DriveApp.getFileById(r.id);
+            if (f2.getName() !== p.nombreNuevo) {
+              f2.setName(p.nombreNuevo);
+              renombrados++;
+            }
+          } catch (e) { /* se resolverá en la próxima corrida */ }
+        } else {
+          errores.push({ fila: p.fila, numero: p.numero, error: r.error });
+        }
+      });
+    } else {
+      pospuestos = problemas.length;
+    }
+  }
+
+  // ─── 6) Resumen final ───
+  const lineas = [];
+  lineas.push('📝 Renombrado de PDFs');
+  lineas.push('');
+  lineas.push('Filas procesadas:      ' + data.length);
+  lineas.push('Renombrados:           ' + renombrados);
+  lineas.push('Sin cambio (ya OK):    ' + sinCambio);
+  lineas.push('Auto-recuperados:      ' + autoRecuperados);
+  lineas.push('Reemplazados manual:   ' + reemplazados);
+  lineas.push('Pospuestos:            ' + pospuestos);
+  lineas.push('Sin PDF vinculado:     ' + sinPDF);
+  lineas.push('Errores:               ' + errores.length);
+
+  if (problemas.length && pospuestos) {
+    lineas.push('');
+    lineas.push('PDFs sin resolver:');
+    problemas.slice(0, 20).forEach(p => {
+      lineas.push('  · Fila ' + p.fila + ' · N° ' + p.numero + '  — ' + p.motivo);
+    });
+    Logger.log(JSON.stringify(problemas, null, 2));
+  }
+
+  if (errores.length) {
+    lineas.push('');
+    lineas.push('Errores inesperados:');
+    errores.slice(0, 20).forEach(e => {
+      lineas.push('  · Fila ' + e.fila + ' · N° ' + e.numero + '\n      ' + e.error);
+    });
+    Logger.log(JSON.stringify(errores, null, 2));
+  }
+
+  Logger.log(lineas.join('\n'));
+  ui.alert(lineas.join('\n'));
+}
+
+/**
+ * Sólo muestra en el log qué renombraría, sin tocar nada.
+ * Útil para revisar antes de correr la función real.
+ */
+function previsualizarRenombradoPDFs() {
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const sh = ss.getSheetByName(HOJA_RESUMEN);
+  if (!sh) { Logger.log('No existe "Resumen Facturación"'); return; }
+
+  const lr = Math.max(sh.getLastRow(), 1);
+  if (lr < 2) { Logger.log('Sin facturas'); return; }
+
+  const nCols = Math.max(sh.getLastColumn(), COL.PDF_ID);
+  const data  = sh.getRange(2, 1, lr - 1, nCols).getValues();
+
+  const lineas = [];
+  let conCambio     = 0;
+  let papelera      = 0;
+  let inaccesibles  = 0;
+  let recuperables  = 0;
+
+  data.forEach((fila, i) => {
+    const numero  = String(fila[COL.NUMERO - 1] || '').trim();
+    const codigo  = String(fila[COL.CODIGO - 1] || '').trim();
+    const periodo = String(fila[COL.PERIODO - 1] || '').trim();
+    const tipo    = String(fila[COL.TIPO - 1] || '').trim();
+    const pdfId   = String(fila[COL.PDF_ID - 1] || '').trim();
+    if (!pdfId || !numero) return;
+
+    const nombreNuevo = _construirNombreArchivoEstandar({ numero, codigo, periodo, tipo });
+    let file = null, motivo = '';
+    try {
+      file = DriveApp.getFileById(pdfId);
+      let trashed = false;
+      try { trashed = file.isTrashed(); } catch (e) {}
+      if (trashed) { file = null; motivo = 'EN PAPELERA'; }
+    } catch (e) {
+      file = null;
+      motivo = 'INACCESIBLE: ' + (e.message || e);
+    }
+
+    // Simular auto-búsqueda
+    if (!file) {
+      const busqueda = _buscarPDFEnDriveDelCentro(codigo, numero);
+      if (busqueda.ok && busqueda.encontrado) {
+        recuperables++;
+        lineas.push('· Fila ' + (i + 2) + '  N° ' + numero + '  ⚠️ ' + motivo +
+                    '  →  auto-recuperable');
+        lineas.push('    id actual:     ' + pdfId);
+        lineas.push('    id encontrado: ' + busqueda.id + '  (' + busqueda.carpeta + ')');
+        lineas.push('    nombre encontrado: ' + busqueda.nombre);
+        lineas.push('    nombre esperado:   ' + nombreNuevo);
+        return;
+      }
+      if (motivo.indexOf('PAPELERA') !== -1) papelera++;
+      else inaccesibles++;
+      lineas.push('· Fila ' + (i + 2) + '  N° ' + numero + '  ❌ ' + motivo);
+      lineas.push('    id actual:  ' + pdfId);
+      lineas.push('    auto-búsqueda:  ' + (busqueda.error || 'sin resultado'));
+      return;
+    }
+
+    const actual = file.getName();
+    if (actual === nombreNuevo) return;
+
+    conCambio++;
+    lineas.push('· Fila ' + (i + 2) + '  N° ' + numero);
+    lineas.push('    de:  ' + actual);
+    lineas.push('    a:   ' + nombreNuevo);
+  });
+
+  const cab = [
+    '🔍 Previsualización de renombrado',
+    '',
+    '· A renombrar:             ' + conCambio,
+    '· Auto-recuperables:       ' + recuperables + '  (en papelera pero encontrados)',
+    '· En papelera (sin match): ' + papelera,
+    '· Inaccesibles:            ' + inaccesibles,
+    ''
+  ].join('\n');
+
+  Logger.log(cab + lineas.join('\n'));
+}
