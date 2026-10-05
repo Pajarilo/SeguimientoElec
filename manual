@@ -1,0 +1,1778 @@
+<!DOCTYPE html>
+<html lang="es-CL">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Manual de Usuario — Seguimiento de Facturación Electricidad</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box }
+
+    :root {
+      --bg: #0f1115;
+      --surface: #171a21;
+      --surface-2: #1f232c;
+      --border: #2e333e;
+      --text: #e7e9ee;
+      --text-dim: #9097a6;
+      --green: #10b981;
+      --amber: #f59e0b;
+      --accent: #3b82f6;
+      --red: #ef4444;
+      --purple: #a78bfa
+    }
+
+    body.light {
+      --bg: #f1f5f9;
+      --surface: #fff;
+      --surface-2: #f8fafc;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --text-dim: #64748b
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.65;
+      transition: background .2s, color .2s;
+      color-scheme: dark
+    }
+
+    body.light { color-scheme: light }
+
+    .manual-layout {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      gap: 32px;
+      max-width: 1300px;
+      margin: 0 auto;
+      padding: 32px 24px 80px
+    }
+
+    @media (max-width: 960px) {
+      .manual-layout { grid-template-columns: 1fr; gap: 16px; padding: 20px 16px 60px }
+      .sidebar { position: static !important; max-height: none !important }
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 24px;
+      align-self: start;
+      max-height: calc(100vh - 48px);
+      overflow-y: auto;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px 18px
+    }
+
+    .sidebar h2 {
+      font-size: .72rem;
+      text-transform: uppercase;
+      letter-spacing: .8px;
+      color: var(--text-dim);
+      font-weight: 700;
+      margin-bottom: 14px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border)
+    }
+
+    .sidebar nav { display: flex; flex-direction: column; gap: 2px }
+
+    .sidebar nav a {
+      display: block;
+      color: var(--text-dim);
+      text-decoration: none;
+      padding: 7px 10px;
+      border-radius: 6px;
+      font-size: .82rem;
+      font-weight: 500;
+      transition: all .15s;
+      border-left: 2px solid transparent
+    }
+
+    .sidebar nav a:hover {
+      background: var(--surface-2);
+      color: var(--text);
+      border-left-color: var(--accent)
+    }
+
+    .sidebar nav a.active {
+      background: rgba(59, 130, 246, .10);
+      color: var(--accent);
+      border-left-color: var(--accent);
+      font-weight: 600
+    }
+
+    .content { min-width: 0 }
+
+    .content-header {
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 32px
+    }
+
+    .content-header h1 {
+      font-size: 1.9rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #3b82f6 0%, #06b6d4 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      line-height: 1.25;
+      margin-bottom: 8px
+    }
+
+    body.light .content-header h1 {
+      background: linear-gradient(135deg, #1d4ed8 0%, #0891b2 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text
+    }
+
+    .content-header .subtitle { color: var(--text-dim); font-size: .92rem }
+
+    .content-header .meta-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 12px;
+      border-radius: 20px;
+      background: rgba(59, 130, 246, .10);
+      color: var(--accent);
+      border: 1px solid rgba(59, 130, 246, .30);
+      font-weight: 600;
+      font-size: .72rem;
+      margin-top: 12px;
+      letter-spacing: .3px
+    }
+
+    .manual-section { scroll-margin-top: 24px; margin-bottom: 48px }
+
+    .manual-section > h2 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      margin-bottom: 8px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: baseline;
+      gap: 10px
+    }
+
+    .manual-section > h2 .num {
+      display: inline-block;
+      min-width: 28px;
+      color: var(--accent);
+      font-variant-numeric: tabular-nums;
+      font-weight: 800;
+      font-size: 1.1rem
+    }
+
+    .manual-section > h3 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin: 24px 0 8px;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 8px
+    }
+
+    .manual-section > h3::before {
+      content: '';
+      width: 3px;
+      height: 14px;
+      background: var(--accent);
+      border-radius: 2px;
+      flex-shrink: 0
+    }
+
+    .manual-section > h4 {
+      font-size: .92rem;
+      font-weight: 600;
+      margin: 22px 0 8px;
+      color: var(--text)
+    }
+
+    .manual-section > h4 .dim {
+      color: var(--text-dim);
+      font-weight: 400;
+      font-size: .82rem
+    }
+
+    .manual-section p { color: var(--text); margin-bottom: 12px }
+    .manual-section p.dim { color: var(--text-dim); font-size: .88rem }
+    .manual-section ul, .manual-section ol { margin: 0 0 14px 22px; color: var(--text) }
+    .manual-section li { margin-bottom: 6px }
+    .manual-section li::marker { color: var(--accent) }
+
+    .callout {
+      border-radius: 10px;
+      padding: 14px 18px;
+      margin: 16px 0;
+      font-size: .88rem;
+      line-height: 1.7;
+      border-left: 3px solid
+    }
+
+    .callout.info { background: rgba(59, 130, 246, .08); border-color: var(--accent); color: var(--text) }
+    .callout.tip { background: rgba(16, 185, 129, .08); border-color: var(--green); color: var(--text) }
+    .callout.warn { background: rgba(245, 158, 11, .10); border-color: var(--amber); color: var(--text) }
+    .callout.danger { background: rgba(239, 68, 68, .08); border-color: var(--red); color: var(--text) }
+
+    .callout .title {
+      display: block;
+      font-weight: 700;
+      font-size: .78rem;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      margin-bottom: 4px
+    }
+
+    .callout.info .title { color: #60a5fa }
+    .callout.tip .title { color: #34d399 }
+    .callout.warn .title { color: #fbbf24 }
+    .callout.danger .title { color: #f87171 }
+
+    body.light .callout.info .title { color: #1d4ed8 }
+    body.light .callout.tip .title { color: #047857 }
+    body.light .callout.warn .title { color: #b45309 }
+    body.light .callout.danger .title { color: #b91c1c }
+
+    .callout ul { margin: 6px 0 0 20px }
+    .callout li { margin-bottom: 3px }
+
+    .captura {
+      margin: 18px 0 22px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      background: var(--surface)
+    }
+
+    .captura img { display: block; width: 100%; height: auto; background: var(--surface-2) }
+
+    .captura .placeholder {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-height: 220px;
+      padding: 40px 24px;
+      background:
+        repeating-linear-gradient(45deg,
+          var(--surface) 0px,
+          var(--surface) 12px,
+          var(--surface-2) 12px,
+          var(--surface-2) 24px);
+      color: var(--text-dim);
+      text-align: center;
+      border-bottom: 1px dashed var(--border)
+    }
+
+    .captura .placeholder .icon { font-size: 2rem; opacity: .7 }
+    .captura .placeholder .label { font-size: .82rem; font-weight: 600; color: var(--text) }
+    .captura .placeholder .hint { font-size: .74rem; max-width: 460px; line-height: 1.5 }
+
+    .captura .placeholder code {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: .72rem;
+      background: var(--bg);
+      padding: 2px 6px;
+      border-radius: 4px;
+      border: 1px solid var(--border)
+    }
+
+    .captura figcaption {
+      padding: 10px 16px;
+      background: var(--surface-2);
+      border-top: 1px solid var(--border);
+      font-size: .76rem;
+      color: var(--text-dim);
+      line-height: 1.55;
+      font-style: italic
+    }
+
+    .captura figcaption b { color: var(--text); font-style: normal }
+
+    .manual-table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: .82rem;
+      margin: 16px 0;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden
+    }
+
+    .manual-table th {
+      background: var(--surface-2);
+      color: var(--text-dim);
+      padding: 11px 14px;
+      font-size: .7rem;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      font-weight: 700;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap
+    }
+
+    .manual-table td {
+      padding: 11px 14px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+      vertical-align: top;
+      line-height: 1.55
+    }
+
+    .manual-table tr:last-child td { border-bottom: none }
+    .manual-table tr:hover td { background: rgba(59, 130, 246, .04) }
+
+    .manual-table .kbd-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 5px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-bottom-width: 2px;
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: .74rem;
+      color: var(--text);
+      margin: 0 2px
+    }
+
+    .manual-table code {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: .74rem;
+      background: var(--bg);
+      padding: 1px 6px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      color: var(--accent)
+    }
+
+    .chip {
+      display: inline-block;
+      padding: 3px 9px;
+      border-radius: 6px;
+      font-size: .72rem;
+      font-weight: 600;
+      line-height: 1.4;
+      white-space: nowrap
+    }
+
+    .chip.recibida { background: rgba(16, 185, 129, .18); color: #34d399; border: 1px solid rgba(16, 185, 129, .35) }
+    .chip.pendiente { background: rgba(245, 158, 11, .12); color: #fbbf24; border: 1px solid rgba(245, 158, 11, .30) }
+    .chip.plazo { background: rgba(59, 130, 246, .10); color: #60a5fa; border: 1px dashed rgba(59, 130, 246, .40) }
+    .chip.na { background: rgba(148, 163, 184, .10); color: #cbd5e1; border: 1px dashed rgba(148, 163, 184, .40) }
+    .chip.si { background: rgba(107, 114, 128, .12); color: #9ca3af; border: 1px dashed rgba(107, 114, 128, .35) }
+
+    body.light .chip.recibida { background: rgba(16, 185, 129, .12); color: #047857 }
+    body.light .chip.pendiente { background: rgba(245, 158, 11, .12); color: #b45309 }
+    body.light .chip.plazo { background: rgba(59, 130, 246, .10); color: #1d4ed8 }
+    body.light .chip.na { background: rgba(100, 116, 139, .10); color: #475569 }
+    body.light .chip.si { background: rgba(107, 114, 128, .10); color: #4b5563 }
+
+    .sidebar .sidebar-theme-wrap { display: flex; justify-content: flex-end; margin-bottom: 12px }
+
+    #btnTheme {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 6px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: .76rem;
+      font-family: inherit;
+      transition: all .15s
+    }
+
+    #btnTheme:hover { border-color: var(--accent); color: var(--accent) }
+
+    #btnTop {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 100;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      cursor: pointer;
+      font-size: 1.1rem;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      transition: all .15s;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, .2)
+    }
+
+    #btnTop.show { display: flex }
+    #btnTop:hover { border-color: var(--accent); color: var(--accent) }
+
+    footer.site-footer {
+      max-width: 1300px;
+      margin: 40px auto 0;
+      padding: 24px 24px;
+      border-top: 1px solid var(--border);
+      text-align: center;
+      color: var(--text-dim);
+      font-size: .74rem;
+      line-height: 1.7
+    }
+
+    footer.site-footer .badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 20px;
+      background: rgba(59, 130, 246, .10);
+      color: var(--accent);
+      border: 1px solid rgba(59, 130, 246, .30);
+      font-weight: 600;
+      margin-bottom: 8px;
+      letter-spacing: .3px
+    }
+
+    /* ═══════════════════════════════════════════════════════════
+       REGLAS DE IMPRESIÓN / EXPORTAR A PDF
+       ═══════════════════════════════════════════════════════════
+       Objetivo: al hacer Ctrl+P (o Cmd+P) → "Guardar como PDF",
+       el manual se renderiza limpio, en una sola columna, sin
+       índice lateral ni botones flotantes. El color de los chips
+       se conserva para que la lectura de estados siga siendo útil.
+    */
+    @media print {
+      /* 1) Forzar esquema claro al imprimir: ahorra tinta y mejora
+            la legibilidad sobre papel blanco. */
+      :root,
+      body.light {
+        --bg: #ffffff;
+        --surface: #ffffff;
+        --surface-2: #f8fafc;
+        --border: #cbd5e1;
+        --text: #0f172a;
+        --text-dim: #475569;
+      }
+
+      body, body.light {
+        background: #ffffff !important;
+        color: #0f172a !important;
+        color-scheme: light !important;
+        font-size: 11.5px;
+        line-height: 1.5;
+        padding: 0 !important;
+      }
+
+      /* 2) Ocultar todo lo que es interacción, no contenido. */
+      .sidebar,
+      #btnTop,
+      #btnTheme,
+      .sidebar-theme-wrap {
+        display: none !important;
+      }
+
+      /* 3) Layout a una sola columna, sin gaps laterales. */
+      .manual-layout {
+        display: block !important;
+        grid-template-columns: 1fr !important;
+        gap: 0 !important;
+        max-width: 100% !important;
+        margin: 0 !important;
+        padding: 0 !important;
+      }
+
+      .content { min-width: 0 !important }
+
+      /* 4) Evitar cortes feos dentro de bloques lógicos. */
+      .manual-section,
+      .manual-table,
+      .captura,
+      .callout {
+        break-inside: avoid;
+        page-break-inside: avoid;
+      }
+
+      /* 5) Mantener el color de los chips de estado (verde, ámbar,
+            azul, etc.). Sin esto, Chrome los imprime en blanco y
+            negro y se pierde la lectura rápida del estado. */
+      .chip,
+      .content-header h1,
+      .meta-badge,
+      .site-footer .badge {
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
+
+      /* 6) Encabezado: reducir tamaño y eliminar el gradiente
+            (algunas impresoras no renderizan background-clip: text
+            y el título sale invisible). */
+      .content-header {
+        padding-bottom: 12px;
+        margin-bottom: 20px;
+      }
+      .content-header h1 {
+        font-size: 1.5rem;
+        background: none !important;
+        -webkit-text-fill-color: #0f172a !important;
+        color: #0f172a !important;
+      }
+
+      /* 7) Secciones y encabezados: reducir márgenes para ganar
+            densidad de contenido por página. */
+      .manual-section { margin-bottom: 22px }
+      .manual-section > h2 { font-size: 1.05rem; margin-bottom: 6px }
+      .manual-section > h3 { font-size: .92rem; margin-top: 14px }
+      .manual-section > h4 { font-size: .86rem; margin-top: 12px }
+
+      /* 8) Tablas: reducir padding y tamaño de fuente. Evitar
+            anchos forzados que rompan el layout del papel. */
+      .manual-table {
+        font-size: .72rem;
+        page-break-inside: auto;
+      }
+      .manual-table th { padding: 6px 8px; font-size: .62rem }
+      .manual-table td { padding: 6px 8px }
+      .manual-table tr { break-inside: avoid }
+      .manual-table thead { display: table-header-group }
+
+      /* 9) Callouts: menos padding y borde más sutil. */
+      .callout {
+        padding: 10px 14px;
+        margin: 10px 0;
+        font-size: .78rem;
+      }
+      .callout .title { font-size: .68rem }
+
+      /* 10) Figuras: dejar que la imagen escale al ancho del papel
+             y evitar que se partan entre páginas. */
+      .captura {
+        margin: 10px 0 14px;
+        break-inside: avoid;
+      }
+      .captura img { max-width: 100%; height: auto }
+      .captura figcaption { padding: 6px 12px; font-size: .68rem }
+      .captura .placeholder { min-height: 120px; padding: 20px 16px }
+
+      /* 11) Footer: sin margen superior grande. */
+      footer.site-footer {
+        margin-top: 20px;
+        padding: 12px 0;
+        font-size: .66rem;
+        max-width: 100%;
+      }
+
+      /* 12) Opcional: expandir URLs para que se vean en papel.
+             Descomenta si quieres que aparezcan los enlaces. */
+      /*
+      a[href]::after {
+        content: " (" attr(href) ")";
+        font-size: .65em;
+        color: #64748b;
+      }
+      */
+
+      /* 13) Control de viudas/huérfanas en párrafos. */
+      p, li { orphans: 3; widows: 3 }
+    }
+  </style>
+</head>
+
+<body>
+
+  <button id="btnTop" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Volver arriba">↑</button>
+
+  <div class="manual-layout">
+
+    <aside class="sidebar">
+      <div class="sidebar-theme-wrap">
+        <button id="btnTheme" onclick="toggleTheme()" title="Cambiar tema claro/oscuro">🌙 Modo oscuro</button>
+      </div>
+      <h2>Índice</h2>
+      <nav id="indice">
+        <a href="#intro">Cómo usar este manual</a>
+        <a href="#pantalla">1 · Conocer la pantalla</a>
+        <a href="#vistas">2 · Cambiar de vista</a>
+        <a href="#filtros">3 · Filtrar la información</a>
+        <a href="#kpis">4 · Leer las tarjetas y montos</a>
+        <a href="#buscar">5 · Buscar una factura</a>
+        <a href="#cargar">6 · Cargar una factura</a>
+        <a href="#detalle">7 · Usar la Vista Detalle</a>
+        <a href="#revisar">8 · Revisar el PDF (OCR)</a>
+        <a href="#guardar">9 · Guardar y editar</a>
+        <a href="#recepcion">10 · Registrar recepción</a>
+        <a href="#rectificar">11 · Corregir y eliminar</a>
+        <a href="#centros">12 · Centros de costo</a>
+        <a href="#estados">13 · Qué significa cada estado</a>
+        <a href="#ayuda">14 · Si algo no funciona</a>
+      </nav>
+    </aside>
+
+    <main class="content">
+
+      <header class="content-header">
+        <h1>Manual de Usuario — Seguimiento de Facturación Electricidad</h1>
+        <div class="subtitle">Guía práctica para el día a día: registrar, revisar y seguir tus facturas.</div>
+        <div class="meta-badge">📘 Versión __MANUAL_VERSION__</div>
+      </header>
+
+      <!-- INTRO -->
+      <section id="intro" class="manual-section">
+        <h2><span class="num">§</span>Cómo usar este manual</h2>
+        <p>
+          Este manual explica paso a paso cómo operar la aplicación. Cada sección
+          corresponde a una acción concreta del día a día: cargar una factura,
+          registrar su recepción, revisar un PDF o corregir un dato mal ingresado.
+        </p>
+        <p class="dim">
+          Si buscas algo puntual, usa el índice de la izquierda. Si estás empezando,
+          recórrelo en orden: va de lo más básico a lo más específico.
+        </p>
+      </section>
+
+      <!-- 1 · PANTALLA -->
+      <section id="pantalla" class="manual-section">
+        <h2><span class="num">1</span>Conocer la pantalla</h2>
+        <p>
+          La aplicación tiene tres zonas principales:
+        </p>
+        <ul>
+          <li><b>Encabezado</b> — el título, los filtros y los botones para cambiar de vista.</li>
+          <li><b>Barra de acciones</b> — debajo del encabezado: buscador, botones de carga y acceso a Centros de costo.</li>
+          <li><b>Tarjetas y contenido</b> — las tarjetas de resumen y la vista activa (Dashboard, Detalle o Seguimiento).</li>
+        </ul>
+
+        <figure class="captura">
+          <img data-img="pantalla-principal" alt="Pantalla principal" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" hidden>
+          <div class="placeholder">
+            <span class="icon">🖼️</span>
+            <span class="label">Captura pendiente · Pantalla principal</span>
+            <span class="hint">Reemplaza por <code>&lt;img src="ruta/pantalla.png"&gt;</code> y borra el <code>&lt;div class="placeholder"&gt;</code>.</span>
+          </div>
+          <figcaption><b>Figura 1.</b> Zonas principales de la pantalla.</figcaption>
+        </figure>
+
+      </section>
+
+      <!-- 2 · VISTAS -->
+      <section id="vistas" class="manual-section">
+        <h2><span class="num">2</span>Cambiar de vista</h2>
+        <p>
+          Arriba a la derecha verás botones para moverte entre las tres vistas.
+          El botón de la vista activa se oculta, así que siempre tendrás a mano
+          los otros dos.
+        </p>
+
+        <table class="manual-table">
+          <thead>
+            <tr>
+              <th>Vista</th>
+              <th>Para qué sirve</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>📊 Dashboard</b></td>
+              <td>Ver gráficos comparativos: evolución mensual, rankings por centro, distribución por concepto.</td>
+            </tr>
+            <tr>
+              <td><b>📋 Detalle</b></td>
+              <td>Ver todas las facturas en una tabla. Ideal para editar campos directamente y filtrar por estado.</td>
+            </tr>
+            <tr>
+              <td><b>📊 Seguimiento</b></td>
+              <td>Ver la grilla centro × mes. Es donde registras la recepción de cada factura.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <figure class="captura">
+          <img data-img="botones-vista" alt="Botones de vista" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" hidden>
+          <div class="placeholder">
+            <span class="icon">🖼️</span>
+            <span class="label">Captura pendiente · Botones de cambio de vista</span>
+            <span class="hint">Reemplaza por <code>&lt;img src="ruta/vistas.png"&gt;</code>.</span>
+          </div>
+          <figcaption><b>Figura 2.</b> Botones para cambiar entre Dashboard, Detalle y Seguimiento.</figcaption>
+        </figure>
+
+        <div class="callout tip">
+          <span class="title">Ir y volver</span>
+          Si haces clic en una barra del gráfico <b>Estado de recepción por mes</b> del
+          Dashboard, te lleva a Seguimiento con ese mes ya filtrado y aparece un botón
+          <b>← Volver al Dashboard</b> para regresar.
+        </div>
+      </section>
+
+      <!-- 3 · FILTROS -->
+      <section id="filtros" class="manual-section">
+        <h2><span class="num">3</span>Filtrar la información</h2>
+        <p>
+          Los filtros se ven arriba, al lado del título. Al cambiarlos, todo lo que
+          ves (tarjetas, tablas, gráficos) se actualiza al instante.
+        </p>
+
+        <table class="manual-table">
+          <thead>
+            <tr>
+              <th>Filtro</th>
+              <th>Qué hace</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>🏢 Centro</b></td>
+              <td>Ver todos los centros o uno en particular.</td>
+            </tr>
+            <tr>
+              <td><b>📅 Mes</b></td>
+              <td>Ver todos los meses, los últimos 3, 6 o 12, o un mes específico.</td>
+            </tr>
+            <tr>
+              <td><b>📊 Métrica</b></td>
+              <td>Sólo en el Dashboard: elegir qué monto comparar (Total, Suministro, Peaje o Intereses).</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout warn">
+          <span class="title">El mes en curso no se incluye</span>
+          Cuando eliges "últimos 3, 6 o 12 meses", el mes actual no aparece porque
+          todavía no cierra. Por ejemplo, en octubre el rango "últimos 3 meses"
+          muestra julio, agosto y septiembre.
+        </div>
+      </section>
+
+      <!-- 4 · KPIs Y MONTOS -->
+      <section id="kpis" class="manual-section">
+        <h2><span class="num">4</span>Leer las tarjetas y montos</h2>
+        <p>
+          Debajo del encabezado hay varias tarjetas con números clave. Están en las
+          tres vistas y reaccionan a los filtros.
+        </p>
+
+        <table class="manual-table">
+          <thead>
+            <tr>
+              <th>Tarjeta</th>
+              <th>Qué muestra</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><b>Recibidas</b></td><td>Facturas con fecha de recepción registrada.</td></tr>
+            <tr><td><b>Pendientes</b></td><td>Meses pasados en los que todavía no hay factura cargada.</td></tr>
+            <tr><td><b>Atrasadas (&gt;10d)</b></td><td>Facturas que llegaron más de 10 días después de su emisión.</td></tr>
+            <tr><td><b>Total Suministro</b></td><td>Monto acumulado de suministro.</td></tr>
+            <tr><td><b>Total Peaje</b></td><td>Monto acumulado de peaje.</td></tr>
+            <tr><td><b>Total Intereses</b></td><td>Monto acumulado de intereses (suministro + peaje).</td></tr>
+            <tr><td><b>Total facturado</b></td><td>Suma de Suministro + Peaje (sin intereses).</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout tip">
+          <span class="title">Las tarjetas son clickeables</span>
+          Las tarjetas <b>Pendientes</b> y <b>Atrasadas</b> son interactivas: al
+          hacer clic te llevan a la vista Seguimiento mostrando sólo esos casos.
+          Para quitar el filtro, usa el botón <b>✕ Quitar filtro</b> del banner azul.
+        </div>
+
+        <h3>Cómo se compone cada monto</h3>
+        <p>
+          Los montos se digitan campo por campo en la ventana de la factura y
+          provienen directamente del PDF (o del OCR que lo interpretó). El sistema
+          <b>no recalcula</b> los subtotales: cada campo se guarda tal como viene
+          del documento. Lo único que se calcula es la suma consolidada para las
+          tarjetas.
+        </p>
+
+        <table class="manual-table">
+          <thead>
+            <tr>
+              <th>Campo / Monto</th>
+              <th>De dónde sale</th>
+              <th>Cómo se acumula en las tarjetas</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>Sum. Neto</b><br><span style="color:var(--text-dim);font-size:.72rem;">(Suministro Neto)</span></td>
+              <td>Se digita en el campo <b>Suministro Neto (Afecto + Exento)</b> de la factura. Agrupa varios cargos (ver tabla siguiente). Se registra sin IVA.</td>
+              <td>Se suma en <b>Total Suministro</b>. También entra en <b>Total facturado</b>.</td>
+            </tr>
+            <tr>
+              <td><b>Peaje</b><br><span style="color:var(--text-dim);font-size:.72rem;">(Peaje Neto)</span></td>
+              <td>Se digita en el campo <b>Peaje Neto</b>. Agrupa todos los cargos de la distribuidora (con sufijo DX). Se registra sin IVA.</td>
+              <td>Se suma en <b>Total Peaje</b>. También entra en <b>Total facturado</b>.</td>
+            </tr>
+            <tr>
+              <td><b>Int. Sum.</b><br><span style="color:var(--text-dim);font-size:.72rem;">(Intereses Suministro)</span></td>
+              <td>Se digita en el campo <b>Intereses (Suministro)</b>. Corresponde al cargo <code>INTERESES</code> del PDF.</td>
+              <td>Se suma junto con Int. Peaje en <b>Total Intereses</b>. <b>No</b> entra en Total facturado.</td>
+            </tr>
+            <tr>
+              <td><b>Int. Peaje</b><br><span style="color:var(--text-dim);font-size:.72rem;">(Intereses Peaje)</span></td>
+              <td>Se digita en el campo <b>Intereses (Peaje)</b>. Corresponde al cargo <code>INTERESES DX</code> del PDF.</td>
+              <td>Se suma junto con Int. Sum. en <b>Total Intereses</b>. <b>No</b> entra en Total facturado.</td>
+            </tr>
+            <tr>
+              <td><b>Otros</b><br><span style="color:var(--text-dim);font-size:.72rem;">(Otros Suministro)</span></td>
+              <td>Cargos de suministro no clasificados en las familias estándar (poco frecuente).</td>
+              <td><b>No</b> entra en las tarjetas de Total Suministro, Total Peaje ni Total facturado. Se ve en el Detalle y en el gráfico <i>Distribución por concepto</i> del Dashboard.</td>
+            </tr>
+            <tr>
+              <td><b>Otros Peaje</b><br><span style="color:var(--text-dim);font-size:.72rem;">(Otros Peaje)</span></td>
+              <td>Cargos de peaje no clasificados en las familias estándar (poco frecuente).</td>
+              <td>Igual que el anterior.</td>
+            </tr>
+            <tr>
+              <td><b>Total</b></td>
+              <td>Se digita en el campo <b>Total factura</b>. Es el monto final impreso en el documento (Afecto + Exento + IVA 19%).</td>
+              <td>Se muestra tal cual en la columna <b>Total</b> del Detalle. Las tarjetas usan la suma de Suministro + Peaje, no este campo.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout info">
+          <span class="title">Total facturado ≠ Total del documento</span>
+          La tarjeta <b>Total facturado</b> es la suma de <b>Sum. Neto + Peaje</b> de todas las facturas visibles. No incluye intereses ni otros cobros. El campo <b>Total</b> de cada factura es el monto impreso en el PDF y puede incluir IVA, intereses y otros cargos; por eso no coincide necesariamente con la tarjeta.
+        </div>
+
+        <div class="callout tip">
+          <span class="title">Facturas UNIFICADAS: no se cuentan dos veces</span>
+          Una factura UNIFICADA contiene suministro <i>y</i> peaje en un solo
+          documento. Para que los montos no se dupliquen, la aplicación la cuenta
+          <b>una sola vez</b> al sumar: su Sum. Neto va a Total Suministro, su
+          Peaje va a Total Peaje, y sus intereses a Total Intereses. En la grilla
+          del Seguimiento sí aparece en las dos columnas (Suministro y Peaje),
+          pero en las tarjetas y en el Dashboard se consolida.
+        </div>
+
+        <h3>Qué contiene cada monto (según COPEC EMOAC)</h3>
+        <p>
+          Cada factura de COPEC EMOAC agrupa los cobros en <b>tres familias</b>.
+          El sistema no pide cargo por cargo: consolida cada familia en un solo
+          campo. Esta es la correspondencia entre lo que muestra el PDF y lo que
+          se registra en el sistema.
+        </p>
+
+        <h4>① Suministro <span class="dim">(cargos por consumo y suministro)</span></h4>
+        <table class="manual-table">
+          <thead>
+            <tr>
+              <th>Cargo en la factura</th>
+              <th>Qué es</th>
+              <th>Cómo se calcula</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>ENERGÍA</b></td>
+              <td>Energía consumida en el período facturado.</td>
+              <td>kWh consumidos × precio unitario ($/kWh).</td>
+            </tr>
+            <tr>
+              <td><b>CARGO DEMANDA HP</b></td>
+              <td>Consumo en Horas Punta. Se calcula con peaks de potencia en una ventana de abril a septiembre, en el horario de 18:00 a 22:00, según el Decreto 9T del Ministerio de Energía.</td>
+              <td>Potencia mensual consumida (kW) × precio unitario ($/kW).</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h4>② Cargos Legales <span class="dim">(regulados, no son consumo)</span></h4>
+        <table class="manual-table">
+          <thead>
+            <tr>
+              <th>Cargo en la factura</th>
+              <th>Qué es</th>
+              <th>Cómo se calcula</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>CARGO TRANSPORTE</b></td>
+              <td>Costo por el uso del sistema de transmisión eléctrica nacional o zonal, para llevar la energía desde la central generadora hasta el punto de conexión del cliente.</td>
+              <td>kWh × precio unitario.</td>
+            </tr>
+            <tr>
+              <td><b>CARGO SERVICIO PÚBLICO BASE</b></td>
+              <td>Servicios complementarios del sistema eléctrico: control de frecuencia, tensión, reservas y otros necesarios para la operación segura y continua.</td>
+              <td>kWh × precio unitario.</td>
+            </tr>
+            <tr>
+              <td><b>CARGO SERVICIO PÚBLICO FET</b></td>
+              <td>Fondo de Estabilización de Tarifas para Clientes Regulados (Ley 21.472, vigente 2023–2032). Cubre la deuda generada por la congelación de tarifas.</td>
+              <td>kWh × precio unitario.</td>
+            </tr>
+            <tr>
+              <td><b>CARGO CEN</b></td>
+              <td>Gestión y control del Coordinador Eléctrico Nacional: balance oferta-demanda y seguridad del sistema.</td>
+              <td>Monto fijo mensual.</td>
+            </tr>
+            <tr>
+              <td><b>CARGO LEY 20.780 ART. 8</b></td>
+              <td>Impuesto a los combustibles fósiles o emisiones de CO₂ en la generación eléctrica, que afecta a centrales a carbón, diésel y gas natural.</td>
+              <td>kWh × precio unitario.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h4>③ Distribución / Peaje <span class="dim">(todo lo que lleva <b>DX</b>)</span></h4>
+        <table class="manual-table">
+          <thead>
+            <tr>
+              <th>Cargo en la factura</th>
+              <th>Qué es</th>
+              <th>Cómo se calcula</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>ENERGÍA DX</b></td>
+              <td>Energía consumida, en su componente de peaje de distribución.</td>
+              <td>kWh × precio unitario regulado ($/kWh).</td>
+            </tr>
+            <tr>
+              <td><b>POTENCIA SUMINISTRADA DX</b></td>
+              <td>Costo por el uso de la red de distribución, según la potencia máxima registrada o contratada por el cliente en el punto de suministro.</td>
+              <td>kW × precio unitario ($/kW).</td>
+            </tr>
+            <tr>
+              <td><b>CARGO POTENCIA HP DX</b></td>
+              <td>Potencia máxima demandada en horario punta, cuando el sistema está más exigido (habitualmente 18:00 a 22:00 en invierno).</td>
+              <td>kW × precio unitario.</td>
+            </tr>
+            <tr>
+              <td><b>COMPRA POTENCIA DX</b></td>
+              <td>Costo por la reserva de capacidad que la distribuidora debe mantener disponible en la red, según la potencia contratada o la máxima registrada.</td>
+              <td>kW × precio unitario.</td>
+            </tr>
+            <tr>
+              <td><b>CARGO FIJO DX</b></td>
+              <td>Cargo mensual fijo por la conexión al sistema.</td>
+              <td>Monto fijo mensual.</td>
+            </tr>
+            <tr>
+              <td><b>INTERESES DX</b></td>
+              <td>Recargo por mora en pagos relacionados con la red de distribución.</td>
+              <td>Monto del recargo.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout info">
+          <span class="title">Regla nemotécnica del proveedor</span>
+          Todos los cargos que pertenecen a la <b>distribuidora</b> llevan el sufijo
+          <b>DX</b> en la factura. Ejemplo: <code>ENERGIA</code> es suministro,
+          <code>ENERGIA DX</code> es peaje.
+        </div>
+
+        <h3>Cómo se consolidan las tres familias en el sistema</h3>
+        <p>
+          El sistema no pide cada cargo por separado: agrupa las tres familias
+          en los campos de la ventana de edición. Esta es la correspondencia
+          exacta entre lo que muestra el PDF y lo que se registra:
+        </p>
+
+        <table class="manual-table">
+          <thead>
+            <tr>
+              <th>Campo del sistema</th>
+              <th>Qué cargos del PDF agrupa</th>
+              <th>Cómo se obtiene</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>Sum. Neto</b><br><span style="color:var(--text-dim);font-size:.72rem;">(Suministro Neto)</span></td>
+              <td>ENERGÍA + CARGO DEMANDA HP + CARGO TRANSPORTE + CARGO SERVICIO PÚBLICO BASE + CARGO SERVICIO PÚBLICO FET + CARGO CEN + CARGO LEY 20.780 ART. 8</td>
+              <td>Suma de los subtotales de las familias <b>Suministro</b> + <b>Cargos Legales</b>. Se registra <b>sin IVA</b>.</td>
+            </tr>
+            <tr>
+              <td><b>Peaje Neto</b></td>
+              <td>ENERGÍA DX + POTENCIA SUMINISTRADA DX + CARGO POTENCIA HP DX + COMPRA POTENCIA DX + CARGO FIJO DX</td>
+              <td>Suma de los subtotales de la familia <b>Distribución / Peaje</b>. Se registra <b>sin IVA</b>.</td>
+            </tr>
+            <tr>
+              <td><b>Int. Sum.</b><br><span style="color:var(--text-dim);font-size:.72rem;">(Intereses Suministro)</span></td>
+              <td>INTERESES (sin DX)</td>
+              <td>Monto del cargo de intereses asociado a la parte de suministro.</td>
+            </tr>
+            <tr>
+              <td><b>Int. Peaje</b><br><span style="color:var(--text-dim);font-size:.72rem;">(Intereses Peaje)</span></td>
+              <td>INTERESES DX</td>
+              <td>Monto del cargo de intereses asociado a la distribución.</td>
+            </tr>
+            <tr>
+              <td><b>Otros</b></td>
+              <td>Cargos del suministro no clasificados en las familias anteriores (poco frecuente).</td>
+              <td>Monto informado aparte.</td>
+            </tr>
+            <tr>
+              <td><b>Otros Peaje</b></td>
+              <td>Cargos de peaje no clasificados en las familias anteriores (poco frecuente).</td>
+              <td>Monto informado aparte.</td>
+            </tr>
+            <tr>
+              <td><b>Total</b></td>
+              <td>Afecto + Exento + IVA 19%</td>
+              <td>Monto final impreso en el pie de la factura. Se digita tal cual.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Facturación Única (lo que el sistema llama "UNIFICADA")</h3>
+        <p>
+          Cuando la factura incorpora <b>en un solo documento</b> los cargos de
+          suministro <b>y</b> de distribución, se trata de una <b>Facturación
+          Única</b>. En el sistema ese tipo se registra como <b>UNIFICADA</b>.
+        </p>
+        <p>
+          En este caso, en la ventana de edición se completan los campos de
+          ambos grupos: <b>Sum. Neto</b> con los cargos de suministro y legales,
+          y <b>Peaje Neto</b> con los cargos DX. Los intereses también se separan
+          en <b>Int. Sum.</b> e <b>Int. Peaje</b>.
+        </p>
+
+        <h3>Factura de Suministro con Peaje pendiente de traspaso</h3>
+        <p>
+          Hay un caso intermedio que conviene conocer: la factura llega
+          <b>sólo con los cargos de suministro</b>, y el peaje se factura
+          <b>por separado</b> más adelante.
+        </p>
+        <p>Esto ocurre por dos motivos:</p>
+        <ul>
+          <li>Errores de lectura por parte de la distribuidora (por ejemplo, Enel Distribución).</li>
+          <li>Envío tardío de las lecturas por parte de la distribuidora.</li>
+        </ul>
+        <p>
+          El traspaso íntegro de los montos de peaje se emite <b>habitualmente
+          el día 27 del mes siguiente</b>, o cuando la distribuidora regulariza
+          las facturas. Por eso, en la vista Seguimiento, una celda de
+          <b>Peaje</b> puede quedar como <span class="chip pendiente">Pendiente</span>
+          más tiempo que la de Suministro del mismo período: no es un error, es
+          el tiempo que tarda la distribuidora en regularizar.
+        </p>
+
+        <div class="callout tip">
+          <span class="title">Fuente original</span>
+          Los conceptos y cálculos de esta sección provienen del documento
+          <b>"Explicación Factura"</b> de COPEC EMOAC. Si necesitas el detalle
+          cargo por cargo de una factura concreta, revisa directamente el PDF
+          de esa factura: ahí aparece cada línea con su cantidad, precio unitario
+          y subtotal.
+        </div>
+      </section>
+
+      <!-- 5 · BUSCAR -->
+      <section id="buscar" class="manual-section">
+        <h2><span class="num">5</span>Buscar una factura</h2>
+        <p>
+          En la barra de acciones hay un buscador. Escribe el <b>N° de factura</b>
+          y presiona <span class="kbd-badge">Enter</span>.
+        </p>
+        <ul>
+          <li>Si la factura existe, se abre su ventana de edición.</li>
+          <li>Si no existe, el buscador muestra <i>"No encontrada"</i> en rojo.</li>
+        </ul>
+
+        <figure class="captura">
+          <img data-img="buscador-facturas" alt="Buscador" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" hidden>
+          <div class="placeholder">
+            <span class="icon">🖼️</span>
+            <span class="label">Captura pendiente · Buscador de facturas</span>
+            <span class="hint">Reemplaza por <code>&lt;img src="ruta/buscador.png"&gt;</code>.</span>
+          </div>
+          <figcaption><b>Figura 3.</b> Buscador por N° de factura.</figcaption>
+        </figure>
+      </section>
+
+      <!-- 6 · CARGAR -->
+      <section id="cargar" class="manual-section">
+        <h2><span class="num">6</span>Cargar una factura</h2>
+        <p>
+          Hay <b>dos caminos válidos</b> para dar de alta una factura. Ambos
+          abren la misma ventana de edición; la diferencia es desde dónde se
+          inicia la carga y qué datos vienen precargados.
+        </p>
+
+        <h3>Camino A — Desde la barra de acciones (carga guiada con PDF)</h3>
+        <p>
+          Es el camino recomendado cuando ya tienes el PDF de la factura.
+          La aplicación lo procesa con OCR y precarga los datos por ti.
+        </p>
+        <ul>
+          <li><b>📄 Cargar PDF</b> — abre el selector de archivos del sistema.
+              Elige el PDF y la aplicación extrae los datos, los muestra en la
+              ventana de edición y guarda el PDF en el Drive del centro.</li>
+          <li><b>🔗 Cargar desde Drive (URL)</b> — copia previamente la URL del
+              PDF en Drive. Al pulsar el botón, la aplicación lee el portapapeles,
+              descarga el PDF y lo procesa igual que el caso anterior.</li>
+        </ul>
+
+        <figure class="captura">
+          <img data-img="barra-acciones-carga" alt="Barra de acciones con los botones de carga" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" hidden>
+          <div class="placeholder">
+            <span class="icon">🖼️</span>
+            <span class="label">Captura pendiente · Barra de acciones (botones de carga)</span>
+            <span class="hint">Reemplaza por <code>&lt;img src="ruta/barra-acciones.png"&gt;</code>. Muestra los botones <b>📄 Cargar PDF</b> y <b>🔗 Cargar desde Drive (URL)</b>.</span>
+          </div>
+          <figcaption><b>Figura 4.</b> Botones de carga en la barra de acciones.</figcaption>
+        </figure>
+
+        <h3>Camino B — Desde una celda del Seguimiento (carga contextual)</h3>
+        <p>
+          Es el camino cómodo cuando estás revisando la grilla centro × mes y
+          detectas que falta una factura en un período concreto.
+        </p>
+        <ol>
+          <li>Ve a la vista <b>Seguimiento</b>.</li>
+          <li>Ubica la fila del centro y la columna del mes que quieres cargar.</li>
+          <li>Haz clic en la <b>celda vacía</b> (la que muestra "Pendiente" o
+              "Por Emitir").</li>
+          <li>Se abre la ventana de edición con el <b>centro</b> y el <b>período</b>
+              ya precargados. Completa los datos y guarda.</li>
+        </ol>
+
+        <div class="callout info">
+          <span class="title">Y si la factura ya existe…</span>
+          Si la celda <b>ya tiene una factura cargada</b> (muestra un chip con
+          el N° o "Recibida"), el clic en la celda <b>no crea otra factura</b>:
+          abre el modal de esa factura para <b>actualizarla</b> (cambiar la fecha
+          de recepción, corregir montos, etc.).
+        </div>
+
+        <div class="callout tip">
+          <span class="title">¿Cuál camino elegir?</span>
+          <ul>
+            <li><b>Con PDF a mano</b> → Camino A. El OCR te ahorra digitar.</li>
+            <li><b>Sin PDF o ya estás en el Seguimiento</b> → Camino B. El centro
+                y el período vienen precargados por el contexto de la celda.</li>
+          </ul>
+        </div>
+
+        <h3>Qué pasa después de cargar el PDF (Camino A)</h3>
+        <ol>
+          <li>La aplicación lee el PDF y extrae automáticamente los datos
+              (N° de factura, fechas, montos, kWh, etc.).</li>
+          <li>Se abre la ventana de edición con los campos precargados.</li>
+          <li>Revisas los datos, corriges lo que haga falta y presionas
+              <b>💾 Guardar</b>.</li>
+        </ol>
+
+        <h3>Qué datos completar</h3>
+        <p>En la ventana de la factura encontrarás:</p>
+        <ul>
+          <li><b>Centro de costo</b> y <b>Período</b> — precargados (por el OCR
+              en el Camino A, o por la celda en el Camino B).</li>
+          <li><b>Tipo de factura</b> — Suministro, Peaje, Unificada o Arriendo de medidor.</li>
+          <li><b>N° Factura</b> — obligatorio.</li>
+          <li><b>Fechas</b> — recepción, emisión y vencimiento.</li>
+          <li><b>Montos y kWh</b> — total, suministro, peaje, intereses, otros.</li>
+          <li><b>PDF</b> — se adjunta automáticamente desde el archivo o la URL de Drive.</li>
+        </ul>
+
+        <figure class="captura">
+          <img data-img="ventana-factura" alt="Ventana de factura" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" hidden>
+          <div class="placeholder">
+            <span class="icon">🖼️</span>
+            <span class="label">Captura pendiente · Ventana de factura</span>
+            <span class="hint">Reemplaza por <code>&lt;img src="ruta/ventana-factura.png"&gt;</code>.</span>
+          </div>
+          <figcaption><b>Figura 5.</b> Ventana para agregar o editar una factura.</figcaption>
+        </figure>
+
+        <div class="callout info">
+          <span class="title">Campos obligatorios</span>
+          Sólo son obligatorios <b>N° Factura</b>, <b>Tipo de factura</b> y
+          <b>Fecha emisión</b>. Si dejas la fecha de recepción vacía, se te avisará
+          y podrás guardar igual.
+        </div>
+      </section>
+
+      <!-- 7 · VISTA DETALLE -->
+      <section id="detalle" class="manual-section">
+        <h2><span class="num">7</span>Usar la Vista Detalle</h2>
+        <p>
+          La Vista Detalle muestra <b>todas las facturas en una sola tabla</b>,
+          una fila por factura. Es la vista más cómoda para revisar, comparar y
+          editar campos sin tener que abrir la ventana de edición.
+        </p>
+
+
+        <h3>Filtros de la Vista Detalle</h3>
+        <p>
+          Sobre la tabla hay una fila de filtros rápidos. Marca o desmarca las
+          casillas y la tabla se actualiza al instante:
+        </p>
+        <ul>
+          <li><b>Solo recibidas con desfase</b> — muestra únicamente facturas
+              recibidas con más de 7 días de desfase.</li>
+          <li><b>&gt;10 días de desfase</b> — muestra sólo las que superan 10 días.</li>
+          <li><b>Solo con intereses</b> — sólo facturas que tienen intereses &gt; 0.</li>
+          <li><b>Solo S/I</b> — sólo facturas en estado "Sin información".</li>
+          <li><b>Mostrar sólo sin fecha de recibido</b> — oculta las facturas
+              que ya tienen fecha real de recepción. Viene marcado por defecto.</li>
+          <li><b>Ocultar meses no informados</b> — esconde las filas sintéticas
+              (celdas vacías en meses pasados). Viene marcado por defecto.</li>
+          <li><b>Ver:</b> — un selector para mostrar sólo un tipo de factura
+              (Todo, Unificadas, Suministro, Peaje, Arriendo medidor).</li>
+        </ul>
+
+        <figure class="captura">
+          <img data-img="vista-detalle" alt="Vista Detalle" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" hidden>
+          <div class="placeholder">
+            <span class="icon">🖼️</span>
+            <span class="label">Captura pendiente · Vista Detalle (tabla + filtros)</span>
+            <span class="hint">Reemplaza por <code>&lt;img src="ruta/vista-detalle.png"&gt;</code>. Muestra la tabla completa con la fila de filtros arriba.</span>
+          </div>
+          <figcaption><b>Figura 6.</b> Vista Detalle: tabla de facturas y filtros rápidos.</figcaption>
+        </figure>
+
+        <h3>Editar directamente en la tabla</h3>
+        <p>
+          Las celdas editables se resaltan al pasar el mouse por encima. Para
+          editar un valor:
+        </p>
+        <ol>
+          <li>Haz clic sobre la celda que quieres modificar.</li>
+          <li>Aparece un campo de edición en la misma celda.</li>
+          <li>Escribe el nuevo valor (o elige la fecha en el calendario).</li>
+          <li>Presiona <span class="kbd-badge">Enter</span> o haz clic fuera
+              de la celda para guardar.</li>
+          <li>Si te arrepientes, presiona <span class="kbd-badge">Esc</span>
+              para cancelar la edición.</li>
+        </ol>
+
+        <div class="callout tip">
+          <span class="title">Guardado inmediato</span>
+          El cambio se guarda automáticamente al confirmar. Verás el valor
+          actualizado en la tabla y en las tarjetas de resumen al instante.
+        </div>
+
+        <div class="callout info">
+          <span class="title">Reglas de edición por tipo de factura</span>
+          Las columnas <b>Rec. Sum.</b> y <b>Rec. Peaje</b> sólo son editables
+          cuando el tipo de factura lo permite:
+          <ul>
+            <li><b>SUMINISTRO</b> → sólo editable <b>Rec. Sum.</b></li>
+            <li><b>PEAJE</b> → sólo editable <b>Rec. Peaje</b>.</li>
+            <li><b>ARRIENDO_MEDIDOR</b> → sólo editable <b>Rec. Peaje</b>.</li>
+            <li><b>UNIFICADA</b> → ambas editables, y la misma fecha se refleja en las dos columnas.</li>
+          </ul>
+          Las celdas no editables muestran un guion <b>—</b> y no responden al clic.
+        </div>
+
+        <h3>Editar el N° de factura</h3>
+        <p>
+          Hacer clic en la celda <b>N°</b> no abre un campo de texto: abre la
+          <b>ventana de edición completa</b> de esa factura. Desde ahí puedes
+          modificar cualquier campo, incluido el número.
+        </p>
+
+        <h3>Agregar una factura desde una fila vacía</h3>
+        <p>
+          Si tienes marcada la opción <b>Ocultar meses no informados</b>,
+          las filas sin factura no se ven. Si la desmarcas, aparecen filas
+          sintéticas con un signo <b>+</b> en la primera columna. Al hacer clic
+          sobre cualquiera de esas celdas se abre la ventana para cargar una
+          factura nueva en ese centro y período.
+        </p>
+      </section>
+
+      <!-- 8 · REVISAR PDF -->
+      <section id="revisar" class="manual-section">
+        <h2><span class="num">8</span>Revisar el PDF (OCR)</h2>
+        <p>
+          Cuando cargas un PDF, la aplicación intenta leer sus datos
+          automáticamente y los compara con los del formulario.
+        </p>
+
+        <h3>Botones de la ventana</h3>
+        <table class="manual-table">
+          <thead>
+            <tr>
+              <th>Botón</th>
+              <th>Qué hace</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><b>🔍 Extraer datos OCR</b></td><td>Lee el PDF y compara los datos con los del formulario. <b>No cambia nada</b>: sólo te muestra las diferencias.</td></tr>
+            <tr><td><b>🔄 Actualizar desde OCR</b></td><td>Aplica al formulario lo que se leyó del PDF. <b>No guarda</b>: revisa antes de Guardar.</td></tr>
+            <tr><td><b>🔗 Vincular</b></td><td>Asocia el PDF a la factura y lo renombra de forma estándar.</td></tr>
+            <tr><td><b>🧹 Limpiar</b></td><td>Limpia los campos transaccionales (montos, fechas, kWh) conservando centro, período y N° de factura.</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout tip">
+          <span class="title">Comparación visual</span>
+          Después de extraer, verás un aviso flotante con la lista de diferencias
+          entre lo que hay en el formulario y lo que dice el PDF. Sólo se aplican
+          los cambios cuando pulsas <b>🔄 Actualizar desde OCR</b>.
+        </div>
+
+        <figure class="captura">
+          <img data-img="vista-previa-pdf" alt="Vista previa del PDF" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" hidden>
+          <div class="placeholder">
+            <span class="icon">🖼️</span>
+            <span class="label">Captura pendiente · Vista previa del PDF</span>
+            <span class="hint">Reemplaza por <code>&lt;img src="ruta/vista-previa.png"&gt;</code>.</span>
+          </div>
+          <figcaption><b>Figura 7.</b> Vista previa del PDF junto al formulario.</figcaption>
+        </figure>
+      </section>
+
+      <!-- 9 · GUARDAR Y EDITAR -->
+      <section id="guardar" class="manual-section">
+        <h2><span class="num">9</span>Guardar y editar</h2>
+
+        <h3>Guardar</h3>
+        <p>
+          Pulsa <b>💾 Guardar</b> cuando tengas los datos listos. La factura se
+          registra al instante y verás el cambio reflejado de inmediato en las
+          tablas y las tarjetas.
+        </p>
+
+        <h3>Editar</h3>
+        <p>Puedes editar una factura ya cargada de varias formas:</p>
+        <ul>
+          <li>Buscándola por N° con el buscador de la barra de acciones.</li>
+          <li>Haciendo clic sobre su N° en la Vista Detalle.</li>
+          <li>Haciendo clic sobre cualquier celda editable de la Vista Detalle.</li>
+          <li>Haciendo clic en una celda de la vista Seguimiento (abre la ventana de edición).</li>
+        </ul>
+
+        <div class="callout info">
+          <span class="title">Edición directa en la tabla</span>
+          En la vista Detalle, las columnas con fondo resaltado al pasar el mouse
+          son editables. Haz clic, escribe el nuevo valor y presiona
+          <span class="kbd-badge">Enter</span> (o haz clic fuera). El cambio se
+          guarda solo.
+        </div>
+
+        <div class="callout tip">
+          <span class="title">Guardado inmediato</span>
+          Los cambios se aplican al instante en la pantalla. Si algo fallara al
+          guardar, la aplicación te avisa y revierte automáticamente.
+        </div>
+      </section>
+
+      <!-- 10 · RECEPCIÓN -->
+      <section id="recepcion" class="manual-section">
+        <h2><span class="num">10</span>Registrar recepción</h2>
+        <p>
+          Registrar la recepción significa anotar <b>cuándo llegó</b> una factura
+          que ya está cargada. Se hace desde la vista <b>Seguimiento</b>.
+        </p>
+
+        <ol>
+          <li>Ubica la fila del centro de costo y la columna del mes.</li>
+          <li>Haz clic en la celda.</li>
+          <li>Si la factura ya existe pero le falta la fecha, se abre un
+              pequeño editor con un calendario.</li>
+          <li>Elige la fecha de recepción.</li>
+          <li>Pulsa <b>✔</b> o presiona <span class="kbd-badge">Enter</span>.</li>
+        </ol>
+
+        <p>El mini-editor también trae dos botones extra:</p>
+        <ul>
+          <li><b>📝</b> — abre la ventana completa de la factura.</li>
+          <li><b>✕</b> — cancela la edición sin guardar.</li>
+        </ul>
+
+        <div class="callout info">
+          <span class="title">Cargar vs. registrar recepción</span>
+          Hacer clic en una celda <b>vacía</b> abre la ventana para cargar una
+          factura nueva (equivalente al Camino A de la sección 6). Hacer clic en
+          una celda que <b>ya tiene factura</b> permite registrar su fecha de
+          recepción o editar sus datos.
+        </div>
+
+        <figure class="captura">
+          <img data-img="mini-editor-recepcion" alt="Mini-editor" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" hidden>
+          <div class="placeholder">
+            <span class="icon">🖼️</span>
+            <span class="label">Captura pendiente · Mini-editor de recepción</span>
+            <span class="hint">Reemplaza por <code>&lt;img src="ruta/mini-editor.png"&gt;</code>.</span>
+          </div>
+          <figcaption><b>Figura 8.</b> Mini-editor para registrar la fecha de recepción.</figcaption>
+        </figure>
+      </section>
+
+      <!-- 11 · RECTIFICAR Y ELIMINAR -->
+      <section id="rectificar" class="manual-section">
+        <h2><span class="num">11</span>Corregir y eliminar</h2>
+
+        <h3>Marcar como N/A</h3>
+        <p>
+          Si en un período <b>no corresponde emitir</b> una factura, usa el botón
+          <b>⊘ N/A</b>. La celda quedará marcada como "no aplica" y no contará
+          como pendiente.
+        </p>
+
+        <h3>Rectificar centro o período</h3>
+        <p>
+          Si una factura quedó asignada a un centro o a un mes equivocado, usa
+          <b>✏️ Rectificar Centro de costo/Mes</b>. Podrás elegir el centro y el
+          mes correctos; la corrección se aplicará a todas las filas de esa factura.
+        </p>
+
+        <div class="callout warn">
+          <span class="title">Antes de rectificar</span>
+          Verifica que el N° de factura sea correcto, porque la corrección afecta
+          a <b>todas las filas</b> con ese mismo número.
+        </div>
+
+        <h3>Eliminar</h3>
+        <p>
+          El botón <b>🗑️ Eliminar</b> borra la factura por completo. Antes de
+          ejecutarlo, la aplicación te muestra un resumen con el centro, el período
+          y el monto para que confirmes.
+        </p>
+
+        <div class="callout danger">
+          <span class="title">Eliminar es definitivo</span>
+          No se puede deshacer. Asegúrate de que realmente quieres borrar la factura.
+        </div>
+      </section>
+
+      <!-- 12 · CENTROS -->
+      <section id="centros" class="manual-section">
+        <h2><span class="num">12</span>Centros de costo</h2>
+        <p>
+          Con el botón <b>🏢 Centros de costo</b> de la barra de acciones abres el
+          mantenedor. Ahí puedes:
+        </p>
+        <ul>
+          <li>Ver la lista completa de centros.</li>
+          <li>Editar el <b>nombre</b> y el <b>RUT</b> directamente en la tabla.</li>
+          <li>Elegir el <b>proveedor</b> (EMOAC o Acierta).</li>
+          <li>Ver o reemplazar el <b>Drive de Operaciones</b> y el <b>Drive de la Comunidad</b>.</li>
+          <li><b>➕ Agregar un centro</b> nuevo.</li>
+          <li><b>➕ Agregar un mes</b> nuevo al sistema.</li>
+        </ul>
+
+        <div class="callout info">
+          <span class="title">Se guarda solo</span>
+          Los cambios se guardan automáticamente al salir de cada campo. No hay
+          botón de "Guardar" en el mantenedor.
+        </div>
+
+        <figure class="captura">
+          <img data-img="mantenedor-centros" alt="Mantenedor de centros" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" hidden>
+          <div class="placeholder">
+            <span class="icon">🖼️</span>
+            <span class="label">Captura pendiente · Mantenedor de centros</span>
+            <span class="hint">Reemplaza por <code>&lt;img src="ruta/centros.png"&gt;</code>.</span>
+          </div>
+          <figcaption><b>Figura 9.</b> Mantenedor de centros de costo.</figcaption>
+        </figure>
+      </section>
+
+      <!-- 13 · ESTADOS -->
+      <section id="estados" class="manual-section">
+        <h2><span class="num">13</span>Qué significa cada estado</h2>
+        <p>
+          Cuando miras las celdas de Seguimiento o el Detalle, verás colores y
+          etiquetas. Esta es la referencia:
+        </p>
+
+        <table class="manual-table">
+          <thead>
+            <tr>
+              <th>Estado</th>
+              <th>Significado</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="chip recibida">Recibida</span></td>
+              <td>Ya llegó la factura y tiene fecha de recepción registrada.</td>
+            </tr>
+            <tr>
+              <td><span class="chip pendiente">Pendiente</span></td>
+              <td>El mes ya pasó, pero todavía no hay factura cargada.</td>
+            </tr>
+            <tr>
+              <td><span class="chip plazo">Por Emitir</span></td>
+              <td>El mes está en curso o es futuro; todavía no corresponde emitir.</td>
+            </tr>
+            <tr>
+              <td><span class="chip na">N/A</span></td>
+              <td>En ese período no corresponde emitir factura.</td>
+            </tr>
+            <tr>
+              <td><span class="chip si">S/I</span></td>
+              <td>Sin información.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- 14 · AYUDA -->
+      <section id="ayuda" class="manual-section">
+        <h2><span class="num">14</span>Si algo no funciona</h2>
+
+        <table class="manual-table">
+          <thead>
+            <tr>
+              <th>Qué ves</th>
+              <th>Qué hacer</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>El OCR no responde.</td>
+              <td>Completa los datos manualmente desde el PDF. La factura se guarda igual.</td>
+            </tr>
+            <tr>
+              <td>No aparece el Drive del centro.</td>
+              <td>Haz clic en <b>"Sin configurar. Click para establecerlo"</b> y pega la URL del Drive.</td>
+            </tr>
+            <tr>
+              <td>Una factura no aparece en la grilla.</td>
+              <td>Revisa los filtros de centro y mes. Si hay un banner azul arriba, pulsa <b>✕ Quitar filtro</b>.</td>
+            </tr>
+            <tr>
+              <td>El buscador dice "No encontrada".</td>
+              <td>Revisa el N° de factura. Si aún no existe, cárgala con <b>📄 Cargar PDF</b>.</td>
+            </tr>
+            <tr>
+              <td>"Ya existe una factura con ese N°".</td>
+              <td>La aplicación te ofrecerá actualizarla. Acepta si esos son los datos correctos.</td>
+            </tr>
+            <tr>
+              <td>Una celda de Peaje queda "Pendiente" más tiempo que la de Suministro del mismo período.</td>
+              <td>Es normal si la distribuidora no ha traspasado aún los cargos de peaje. El traspaso se emite habitualmente el día 27 del mes siguiente.</td>
+            </tr>
+            <tr>
+              <td>Un gráfico aparece vacío.</td>
+              <td>Amplía el rango de meses en el filtro 📅 Mes.</td>
+            </tr>
+            <tr>
+              <td>La pantalla se queda "pensando".</td>
+              <td>Recarga la página con <span class="kbd-badge">F5</span>. Los datos se vuelven a cargar.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout tip">
+          <span class="title">Regla general</span>
+          Si algo no responde, primero revisa los filtros y luego recarga la página.
+          En la mayoría de los casos eso resuelve el problema.
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <footer class="site-footer">
+    <div class="badge">Manual v__MANUAL_VERSION__</div>
+    <div>
+      Guía de operación del sistema <strong>Seguimiento de Facturación Electricidad</strong>.
+    </div>
+    <div style="margin-top:6px;opacity:.8;">
+      Autoría: <strong style="color:var(--text);">Rubén Navarro</strong>
+    </div>
+  </footer>
+
+  <script>
+    // ═══════════════════════════════════════════════════════════
+    //  MANUAL DE USUARIO — POPUP CON IMÁGENES DESDE HOJA "img"
+    //  Versión: __MANUAL_VERSION__
+    // ═══════════════════════════════════════════════════════════
+
+    function getModo(){
+      return (typeof google !== 'undefined' && google.script && google.script.run)
+        ? 'script'
+        : 'local';
+    }
+
+    function toggleTheme(){
+      document.body.classList.toggle('light');
+      const btn = document.getElementById('btnTheme');
+      if(document.body.classList.contains('light')){
+        btn.textContent = '☀️ Modo claro';
+        try{ localStorage.setItem('emoac-manual-theme','light'); }catch(e){}
+      } else {
+        btn.textContent = '🌙 Modo oscuro';
+        try{ localStorage.setItem('emoac-manual-theme','dark'); }catch(e){}
+      }
+    }
+    (function(){
+      try{
+        const saved = localStorage.getItem('emoac-manual-theme');
+        const btn = document.getElementById('btnTheme');
+        if(saved === 'light'){
+          document.body.classList.add('light');
+          if(btn) btn.textContent = '☀️ Modo claro';
+        } else {
+          document.body.classList.remove('light');
+          if(btn) btn.textContent = '🌙 Modo oscuro';
+        }
+      }catch(e){}
+    })();
+
+    (function(){
+      const enlaces = Array.from(document.querySelectorAll('#indice a'));
+      const secciones = enlaces
+        .map(a => document.querySelector(a.getAttribute('href')))
+        .filter(Boolean);
+
+      function onScroll(){
+        const y = window.scrollY + 120;
+        let activo = secciones[0];
+        secciones.forEach(sec => {
+          if(sec.offsetTop <= y) activo = sec;
+        });
+        enlaces.forEach(a => {
+          a.classList.toggle('active',
+            activo && a.getAttribute('href') === '#' + activo.id
+          );
+        });
+
+        const btnTop = document.getElementById('btnTop');
+        if(btnTop) btnTop.classList.toggle('show', window.scrollY > 400);
+      }
+
+      window.addEventListener('scroll', onScroll, { passive: true });
+      onScroll();
+    })();
+
+    async function cargarImagenesManual(){
+      let mapa = {};
+      try{
+        mapa = await apiGetImagenesManual();
+      }catch(e){
+        console.warn('No se pudieron cargar las imágenes del manual:', e);
+        return;
+      }
+
+      const norm = (s) => String(s == null ? '' : s)
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, '-');
+
+      const mapaNorm = {};
+      Object.keys(mapa || {}).forEach(k => {
+        mapaNorm[norm(k)] = mapa[k];
+      });
+
+      const imgs = document.querySelectorAll('img[data-img]');
+      imgs.forEach(img => {
+        const clave = img.getAttribute('data-img');
+        const id = mapaNorm[norm(clave)];
+        if(!id){
+          return;
+        }
+        if (id.indexOf('data:') === 0) {
+          img.src = id;
+        } else {
+          img.referrerPolicy = 'no-referrer';
+          img.src = 'https://lh3.googleusercontent.com/d/' + id;
+        }
+        img.hidden = false;
+        img.dataset.hidratada = '1';
+        const fig = img.closest('figure.captura');
+        if(fig){
+          const ph = fig.querySelector('.placeholder');
+          if(ph) ph.remove();
+        }
+        img.onerror = function(){
+          img.hidden = true;
+          const fig2 = img.closest('figure.captura');
+          if(fig2 && !fig2.querySelector('.placeholder')){
+            const ph = document.createElement('div');
+            ph.className = 'placeholder';
+            ph.innerHTML =
+              '<span class="icon">⚠️</span>' +
+              '<span class="label">No se pudo cargar la imagen "' + clave + '"</span>' +
+              '<span class="hint">Revisa que el ID en la hoja "img" sea correcto y que el archivo sea público.</span>';
+            fig2.insertBefore(ph, img);
+          }
+        };
+      });
+    }
+
+    function _normalizarMapaImagenes(res){
+      if(Array.isArray(res)){
+        const obj = {};
+        res.forEach(function(fila){
+          if(!fila) return;
+          const nombre = fila.nombre || fila.name || fila[0];
+          const id     = fila.id     || fila.ID   || fila[1];
+          if(nombre && id) obj[nombre] = id;
+        });
+        return obj;
+      }
+      return res || {};
+    }
+
+    function apiGetImagenesManual(){
+      return new Promise(function(resolve){
+        try{
+          if(window.__IMG_MANUAL__ && typeof window.__IMG_MANUAL__ === 'object'){
+            resolve(_normalizarMapaImagenes(window.__IMG_MANUAL__));
+            return;
+          }
+        }catch(e){}
+
+        if(getModo() !== 'script'){
+          resolve({});
+          return;
+        }
+        google.script.run
+          .withSuccessHandler(function(res){
+            resolve(_normalizarMapaImagenes(res));
+          })
+          .withFailureHandler(function(){ resolve({}); })
+          .obtenerImagenesManual();
+      });
+    }
+
+    document.addEventListener('DOMContentLoaded', function(){
+      cargarImagenesManual();
+      _hidratarImagenesEnBackground();
+    });
+
+    async function _hidratarImagenesEnBackground(){
+      if(typeof google === 'undefined' || !google.script || !google.script.run) return;
+      let hidratadas = {};
+      try{
+        hidratadas = await new Promise((res, rej) => {
+          google.script.run
+            .withSuccessHandler(res)
+            .withFailureHandler(rej)
+            .obtenerImagenesManualHidratadasAsync();
+        });
+      }catch(e){ return; }
+
+      const norm = (s) => String(s == null ? '' : s)
+        .trim().toLowerCase().replace(/\s+/g, '-');
+
+      const mapaNorm = {};
+      Object.keys(hidratadas || {}).forEach(k => { mapaNorm[norm(k)] = hidratadas[k]; });
+
+      document.querySelectorAll('img[data-img]').forEach(img => {
+        const clave = img.getAttribute('data-img');
+        const dataUri = mapaNorm[norm(clave)];
+        if(!dataUri) return;
+        if(img.src && img.src.indexOf('data:') === 0) return;
+        if(img.dataset.hidratada === '1') return;
+        img.src = dataUri;
+        img.dataset.hidratada = '1';
+      });
+    }
+  </script>
+
+</body>
+
+</html>
