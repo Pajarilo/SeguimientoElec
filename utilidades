@@ -1,0 +1,772 @@
+/**
+* ============================================================
+*  utilidades.gs
+*
+*  · Menú "⚡ Funciones adicionales" (onOpen)
+*  · Handlers manuales invocados desde el menú:
+*      - Procesar carpeta de PDFs (masivo)
+*      - Detener procesamiento indefinido
+*      - Limpiar registro de PDFs procesados
+*      - Procesar carpeta de facturas recibidas sin identificar
+*      - Activar/Detener procesado automático de facturas
+*        recibidas sin identificar
+*      - Probar API / Probar Gemini / Probar parsing
+*      - Renombrar PDFs vinculados
+*      - Desbloquear Drive OCR (reset cuota)
+*  · Migraciones one-shot
+*  · Semilla de la hoja Config
+* ============================================================
+*/
+
+// ============================================================
+//  MENÚ
+// ============================================================
+function onOpen() {
+  try {
+    const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_CONFIG);
+    if (sh) _asegurarColumnaEmpresa(sh);
+  } catch (e) { }
+  SpreadsheetApp.getUi()
+    .createMenu('⚡ Funciones adicionales')
+    .addItem('📂 Procesar carpeta de PDFs (masivo)', 'procesarCarpetaPDFsUI')
+    .addItem('📥 Procesar carpeta de facturas recibidas sin identificar', 'procesarCarpetaTransicionUI')
+    .addItem('🗑️ Limpiar registro de PDFs procesados', 'limpiarRegistroPDFsUI')
+    .addSeparator()
+    .addItem('⏰ Activar procesado automático de facturas recibidas sin identificar', 'instalarTriggerTransicion')
+    .addItem('🛑 Detener procesado automático de facturas recibidas sin identificar', 'desinstalarTriggerTransicion')
+    .addItem('🛑 Detener procesamiento indefinido', 'detenerProcesamientoIndefinidoUI')
+    .addSeparator()
+    .addItem('📝 Renombrar PDFs vinculados', 'renombrarTodosLosPDFs')
+    .addItem('🔓 Desbloquear Drive OCR (reset cuota)', 'desbloquearDriveOcrUI')
+    .addSeparator()
+    .addItem('🧪 Probar API', 'probarAPI')
+    .addItem('🤖 Probar Gemini', 'probarGemini')
+    .addItem('🔬 Probar parsing sobre texto (pegar en prompt)', 'probarParsingUI')
+    .addToUi();
+}
+
+// ============================================================
+//  HANDLERS DEL MENÚ
+// ============================================================
+
+function desbloquearDriveOcrUI() {
+  _desbloquearDriveOcr();
+  try { SpreadsheetApp.getUi().alert('✓ Drive OCR desbloqueado. Se reintentará en el próximo PDF.'); }
+  catch (e) { Logger.log('✓ Drive OCR desbloqueado'); }
+}
+
+function detenerProcesamientoIndefinidoUI() {
+  _borrarEstadoPDF();
+  _limpiarTriggersPDF();
+  try { SpreadsheetApp.getUi().alert('🛑 Procesamiento detenido.'); }
+  catch (e) { Logger.log('🛑 detenido'); }
+}
+
+function limpiarRegistroPDFsUI() {
+  const ui = SpreadsheetApp.getUi();
+  const reg = cargarRegistroPDFs();
+  const total = Object.keys(reg).length;
+  if (!total) { ui.alert('El registro ya está vacío.'); return; }
+  const r = ui.alert(
+    '🗑️ Limpiar registro',
+    'Se borrarán ' + total + ' entradas.\n\nLa próxima ejecución procesará TODOS los PDFs.',
+    ui.ButtonSet.YES_NO
+  );
+  if (r !== ui.Button.YES) return;
+  limpiarRegistroPDFs();
+  ui.alert('✓ Registro limpiado.');
+}
+
+function procesarCarpetaPDFsUI() {
+  const ui = SpreadsheetApp.getUi();
+  const r1 = ui.prompt('Paso 1/3 — Carpeta', 'Pega la URL o el ID de la carpeta de Drive a procesar.\nSe recorrerán también las subcarpetas.', ui.ButtonSet.OK_CANCEL);
+  if (r1.getSelectedButton() !== ui.Button.OK) return;
+  const url = r1.getResponseText().trim();
+  if (!url) { ui.alert('No se ingresó URL/ID.'); return; }
+
+  const r2 = ui.alert('Paso 2/3 — Cobertura', '¿Deseas OMITIR los PDFs ya procesados?', ui.ButtonSet.YES_NO_CANCEL);
+  if (r2 === ui.Button.CANCEL) return;
+  const omitirProcesados = (r2 === ui.Button.YES);
+
+  const r3 = ui.alert('Paso 3/3 — Facturas recientes', '¿Deseas OMITIR las facturas procesadas hace menos de 1 día?', ui.ButtonSet.YES_NO_CANCEL);
+  if (r3 === ui.Button.CANCEL) return;
+  const omitirRecientes = (r3 === ui.Button.YES);
+
+  const _limpieza = _limpiarReintentablesDelRegistro();
+  const estado = {
+    url: url, modo: 3,
+    incluirProcesados: !omitirProcesados,
+    reprocesarRecientes: !omitirRecientes,
+    reintentablesLimpiados: _limpieza.borradas + _limpieza.rectificadas,
+    gemini: !!(GEMINI_API_KEY && String(GEMINI_API_KEY).trim()),
+    creado: new Date().toISOString()
+  };
+  _guardarEstadoPDF(estado);
+  _limpiarTriggersPDF();
+
+  let resultado;
+  try { resultado = _ejecutarLotePDF(estado); }
+  catch (e) {
+    Logger.log('❌ procesarCarpetaPDFsUI: ' + e.message + '\n' + (e.stack || '(sin stack)'));
+    ui.alert('❌ Error: ' + e.message + '\n\n(Ver > Registros para el detalle)');
+    return;
+  }
+
+  if (resultado.tiempoAgotado) {
+    _programarSiguienteEjecucionPDF();
+    try { SpreadsheetApp.getActiveSpreadsheet().toast('⏳ Procesamiento en curso. Siguiente tanda ~1 min.', 'Procesamiento masivo', 15); } catch (e) { }
+    return;
+  }
+  _borrarEstadoPDF();
+  _limpiarTriggersPDF();
+  const msg = _resumenResultado(resultado, estado) + '\n\n✅ Procesamiento completo.';
+  try { ui.alert(msg); }
+  catch (e) {
+    try { SpreadsheetApp.getActiveSpreadsheet().toast('✅ Procesamiento completo · ' + resultado.ok + ' facturas', 'Procesamiento masivo', 30); } catch (e2) { }
+  }
+}
+
+function procesarCarpetaTransicionUI() {
+  const ui = SpreadsheetApp.getUi();
+  const r = ui.alert(
+    '📥 Procesar carpeta de facturas recibidas sin identificar',
+    'Se procesarán los PDFs que estén hoy en la carpeta del centro "Sin asignar".\n\n¿Continuar?',
+    ui.ButtonSet.YES_NO
+  );
+  if (r !== ui.Button.YES) return;
+  const res = procesarCarpetaTransicion({ silencioso: false });
+  if (!res.ok) { ui.alert('❌ ' + res.error); return; }
+  if (res.sinActividad) { ui.alert('📭 No hay PDFs en la carpeta de facturas recibidas sin identificar.'); return; }
+  ui.alert(_resumenTransicionUI(res));
+}
+
+function instalarTriggerTransicion() {
+  _limpiarTriggersTransicion();
+  try {
+    ScriptApp.newTrigger(HANDLER_TRANSICION).timeBased().everyHours(1).create();
+    try { SpreadsheetApp.getUi().alert('✓ Procesado automático activado (cada 1 hora).'); } catch (e) { }
+  } catch (e) {
+    try { SpreadsheetApp.getUi().alert('❌ ' + e.message); } catch (e2) { }
+  }
+}
+
+function desinstalarTriggerTransicion() {
+  _limpiarTriggersTransicion();
+  try { SpreadsheetApp.getUi().alert('✓ Procesado automático detenido.'); } catch (e) { }
+}
+
+// ============================================================
+//  PROBES (diálogos de diagnóstico)
+// ============================================================
+
+function probarGemini() {
+  try {
+    if (!GEMINI_API_KEY || !String(GEMINI_API_KEY).trim()) {
+      mostrarMensajeSeguro('⚠ GEMINI_API_KEY no configurada.');
+      return;
+    }
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+      GEMINI_MODEL + ':generateContent?key=' + encodeURIComponent(GEMINI_API_KEY);
+    const payload = { contents: [{ parts: [{ text: 'Responde únicamente con la palabra OK.' }] }] };
+    const res = UrlFetchApp.fetch(url, {
+      method: 'post', contentType: 'application/json',
+      payload: JSON.stringify(payload), muteHttpExceptions: true, timeout: 30
+    });
+    const code = res.getResponseCode();
+    const body = res.getContentText();
+    if (code !== 200) { mostrarMensajeSeguro('❌ HTTP ' + code + '\n\n' + body.slice(0, 500)); return; }
+    const json = JSON.parse(body);
+    const txt = (json.candidates && json.candidates[0] && json.candidates[0].content &&
+      json.candidates[0].content.parts && json.candidates[0].content.parts[0].text) || '(sin texto)';
+    mostrarMensajeSeguro('✓ Gemini OK\n\nModelo: ' + GEMINI_MODEL + '\nRespuesta: ' + txt.trim());
+  } catch (e) { mostrarMensajeSeguro('❌ ' + e.message); }
+}
+
+function probarParsingUI() {
+  const ui = SpreadsheetApp.getUi();
+  const r = ui.prompt('Probar parser', 'Pega el texto OCR crudo (se verá en el log de Apps Script):', ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+  const texto = r.getResponseText();
+  if (!texto) return;
+  _diagReset('(texto pegado)');
+  const campos = _parsearFacturaCompleta(texto);
+  if (campos && campos._error) {
+    ui.alert('❌ El parser lanzó un error:\n\n' + campos._error + '\n\nRevisa el log.');
+    return;
+  }
+  _diagIntentar('Parser manual', true, { campos, chars: texto.length, preview: texto });
+  _diagReporteFinal(campos, 'Parser manual', _camposSonUtilizables(campos));
+  const det = _contarCamposDetectadosBack(campos);
+  ui.alert('✓ Parsing ejecutado\n\nCampos detectados: ' + det.total + '/' + det.totalClaves +
+    (det.faltantes.length ? '\nFaltan: ' + det.faltantes.join(', ') : '\n¡Completo!') +
+    '\n\nRevisa el log (Ver > Registros) para el reporte detallado.');
+}
+
+function probarAPI() {
+  try {
+    const k = calcularResumen();
+    mostrarMensajeSeguro(
+      '✓ API funcionando\n\nFacturas: ' + k.total_facturas +
+      '\nRecibidas: ' + k.recibidas +
+      '\nPendientes: ' + k.pendientes +
+      '\nDentro del plazo: ' + k.dentroPlazo +
+      '\nPor emitir: ' + k.porEmitir +
+      '\nN/A: ' + k.noAplica +
+      '\n\n🤖 Gemini: ' + (GEMINI_API_KEY ? 'configurada' : 'NO configurada')
+    );
+  } catch (e) { mostrarMensajeSeguro('❌ ' + e.message); }
+}
+
+// ============================================================
+//  RENOMBRADO MASIVO
+// ============================================================
+
+function renombrarTodosLosPDFs() {
+  const ui = SpreadsheetApp.getUi();
+
+  const confirmar = ui.alert(
+    '📝 Renombrar PDFs vinculados',
+    'Se recorrerán TODAS las filas con PDF_ID en "Resumen Facturación"\n' +
+    'y se renombrará cada archivo en Drive al formato:\n\n' +
+    '  Periodo_Código_N°Factura_CentroDeCosto_Tipo.pdf\n\n' +
+    'Comportamiento:\n' +
+    '  · Si el archivo ya tiene el nombre correcto → no se toca.\n' +
+    '  · Si el ID está en papelera o es inaccesible, se busca\n' +
+    '    automáticamente en los Drives del centro un archivo cuyo nombre\n' +
+    '    contenga el N° de factura y se usa ese ID.\n' +
+    '  · Si la auto-búsqueda no encuentra nada, se pide el ID manualmente.\n\n' +
+    '¿Continuar?',
+    ui.ButtonSet.YES_NO
+  );
+  if (confirmar !== ui.Button.YES) return;
+
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const sh = ss.getSheetByName(HOJA_RESUMEN);
+  if (!sh) { ui.alert('No existe la hoja "Resumen Facturación".'); return; }
+
+  const lr = Math.max(sh.getLastRow(), 1);
+  if (lr < 2) { ui.alert('No hay facturas.'); return; }
+
+  const nCols = Math.max(sh.getLastColumn(), COL.PDF_ID);
+  const data  = sh.getRange(2, 1, lr - 1, nCols).getValues();
+
+  let renombrados     = 0;
+  let sinCambio       = 0;
+  let sinPDF          = 0;
+  let autoRecuperados = 0;
+  let reemplazados    = 0;
+  let pospuestos      = 0;
+  const problemas     = [];
+  const errores       = [];
+
+  for (let i = 0; i < data.length; i++) {
+    const fila    = data[i];
+    const numero  = String(fila[COL.NUMERO - 1] || '').trim();
+    const codigo  = String(fila[COL.CODIGO - 1] || '').trim();
+    const periodo = String(fila[COL.PERIODO - 1] || '').trim();
+    const tipo    = String(fila[COL.TIPO - 1] || '').trim();
+    const pdfId   = String(fila[COL.PDF_ID - 1] || '').trim();
+
+    if (!pdfId) { sinPDF++; continue; }
+    if (!numero) { sinPDF++; continue; }
+
+    const nombreNuevo = _construirNombreArchivoEstandar({ numero, codigo, periodo, tipo });
+
+    let file = null;
+    let motivoProblema = '';
+    try {
+      file = DriveApp.getFileById(pdfId);
+      let trashed = false;
+      try { trashed = file.isTrashed(); } catch (e) { }
+      if (trashed) { file = null; motivoProblema = 'En papelera'; }
+    } catch (e) {
+      file = null;
+      motivoProblema = 'Inaccesible: ' + (e.message || e);
+    }
+
+    if (!file) {
+      const busqueda = _buscarPDFEnDriveDelCentro(codigo, numero);
+      if (busqueda.ok && busqueda.encontrado) {
+        const rRep = reemplazarPDFFactura(numero, busqueda.id);
+        if (rRep.ok) {
+          autoRecuperados++;
+          try { file = DriveApp.getFileById(busqueda.id); } catch (e) { file = null; }
+          Logger.log('[auto-recuperado] N° ' + numero + '  →  ' + busqueda.id +
+                     '  (' + busqueda.carpeta + ': ' + busqueda.nombre + ')');
+        } else {
+          motivoProblema += ' · No se pudo guardar el ID nuevo: ' + rRep.error;
+        }
+      } else {
+        motivoProblema += ' · Auto-búsqueda: ' + (busqueda.error || 'sin resultado');
+      }
+    }
+
+    if (!file) {
+      problemas.push({
+        fila: i + 2, numero, codigo, pdfId, nombreNuevo,
+        motivo: motivoProblema || 'No se pudo acceder al archivo'
+      });
+      continue;
+    }
+
+    try {
+      const nombreActual = file.getName();
+      if (nombreActual === nombreNuevo) { sinCambio++; continue; }
+      file.setName(nombreNuevo);
+      renombrados++;
+    } catch (e) {
+      problemas.push({
+        fila: i + 2, numero, codigo, pdfId, nombreNuevo,
+        motivo: 'Renombrado falló: ' + (e.message || e)
+      });
+    }
+  }
+
+  if (problemas.length) {
+    const quiereManual = ui.alert(
+      '⚠️ ' + problemas.length + ' PDFs requieren atención',
+      'La auto-búsqueda en el Drive del centro no encontró el archivo para:\n\n' +
+      problemas.slice(0, 10).map(p =>
+        '· Fila ' + p.fila + '  N° ' + p.numero + '  —  ' + p.motivo
+      ).join('\n') +
+      (problemas.length > 10 ? '\n  … y ' + (problemas.length - 10) + ' más' : '') +
+      '\n\n¿Querés ingresar manualmente un ID/URL por cada uno?',
+      ui.ButtonSet.YES_NO
+    );
+
+    if (quiereManual === ui.Button.YES) {
+      problemas.forEach(p => {
+        const resp = ui.prompt(
+          'Reemplazar PDF · Fila ' + p.fila + '  N° ' + p.numero,
+          p.motivo + '\n\n' +
+          'Nombre esperado:\n  ' + p.nombreNuevo + '\n\n' +
+          'ID actual en la BD:\n  ' + p.pdfId + '\n\n' +
+          'Pegá el ID o URL del archivo nuevo (dejá vacío para saltar):',
+          ui.ButtonSet.OK_CANCEL
+        );
+        if (resp.getSelectedButton() !== ui.Button.OK) { pospuestos++; return; }
+        const nuevoId = String(resp.getResponseText() || '').trim();
+        if (!nuevoId) { pospuestos++; return; }
+
+        const r = reemplazarPDFFactura(p.numero, nuevoId);
+        if (r.ok) {
+          reemplazados++;
+          try {
+            const f2 = DriveApp.getFileById(r.id);
+            if (f2.getName() !== p.nombreNuevo) {
+              f2.setName(p.nombreNuevo);
+              renombrados++;
+            }
+          } catch (e) { }
+        } else {
+          errores.push({ fila: p.fila, numero: p.numero, error: r.error });
+        }
+      });
+    } else {
+      pospuestos = problemas.length;
+    }
+  }
+
+  const lineas = [];
+  lineas.push('📝 Renombrado de PDFs');
+  lineas.push('');
+  lineas.push('Filas procesadas:      ' + data.length);
+  lineas.push('Renombrados:           ' + renombrados);
+  lineas.push('Sin cambio (ya OK):    ' + sinCambio);
+  lineas.push('Auto-recuperados:      ' + autoRecuperados);
+  lineas.push('Reemplazados manual:   ' + reemplazados);
+  lineas.push('Pospuestos:            ' + pospuestos);
+  lineas.push('Sin PDF vinculado:     ' + sinPDF);
+  lineas.push('Errores:               ' + errores.length);
+
+  if (problemas.length && pospuestos) {
+    lineas.push('');
+    lineas.push('PDFs sin resolver:');
+    problemas.slice(0, 20).forEach(p => {
+      lineas.push('  · Fila ' + p.fila + ' · N° ' + p.numero + '  — ' + p.motivo);
+    });
+    Logger.log(JSON.stringify(problemas, null, 2));
+  }
+
+  if (errores.length) {
+    lineas.push('');
+    lineas.push('Errores inesperados:');
+    errores.slice(0, 20).forEach(e => {
+      lineas.push('  · Fila ' + e.fila + ' · N° ' + e.numero + '\n      ' + e.error);
+    });
+    Logger.log(JSON.stringify(errores, null, 2));
+  }
+
+  Logger.log(lineas.join('\n'));
+  ui.alert(lineas.join('\n'));
+}
+
+// ============================================================
+//  MIGRACIONES ONE-SHOT
+// ============================================================
+
+function convertirFechasTextoADate() {
+  const ui = SpreadsheetApp.getUi();
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  if (!sh) { ui.alert('No existe la hoja ' + HOJA_RESUMEN); return; }
+  const lr = sh.getLastRow();
+  if (lr < 2) { ui.alert('Sin datos.'); return; }
+
+  const cols = [COL.FECHA_SUMINISTRO, COL.FECHA_PEAJE, COL.FECHA_EMISION, COL.FECHA_VENC];
+  let convertidas = 0;
+
+  cols.forEach(col => {
+    const rango = sh.getRange(2, col, lr - 1, 1);
+    const vals = rango.getValues();
+    let cambio = false;
+    const nuevos = vals.map(r => {
+      const v = r[0];
+      if (v instanceof Date) return [v];
+      if (v === null || v === undefined || v === '') return [v];
+      const s = String(v).trim();
+      if (SENTINELAS.indexOf(s) !== -1) return [v];
+      let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+      if (m) { cambio = true; convertidas++; return [new Date(+m[1], +m[2] - 1, +m[3])]; }
+      m = s.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})$/);
+
+      if (m) { cambio = true; convertidas++; return [new Date(+m[3], +m[2] - 1, +m[1])]; }
+      return [v];
+    });
+    if (cambio) {
+      rango.setNumberFormat('dd/mm/yyyy');
+      rango.setValues(nuevos);
+    }
+  });
+
+  Logger.log('✓ Fechas convertidas a Date: ' + convertidas);
+  ui.alert('✓ Conversión completada.\n\nFechas convertidas: ' + convertidas);
+}
+
+function consolidarCentroSinAsignar() {
+  const ui = SpreadsheetApp.getUi();
+  const ok = ui.alert(
+    '🧹 Consolidar centro "Sin asignar"',
+    'Se unificarán las variantes TEMP / ⚠️ Sin asignar en una sola:\n\n' +
+    '  Centro: "Sin asignar"  ·  Código: "Sin código"\n\n' +
+    'Se actualizarán las facturas del Resumen y la hoja Config.\n\n¿Continuar?',
+    ui.ButtonSet.YES_NO
+  );
+  if (ok !== ui.Button.YES) return;
+
+  const CODIGO_NUEVO  = 'Sin código';
+  const CLIENTE_NUEVO = 'Sin asignar';
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const shResumen = ss.getSheetByName(HOJA_RESUMEN);
+  const shConfig  = ss.getSheetByName(HOJA_CONFIG);
+
+  let facturasActualizadas = 0;
+  let filasConfigBorradas  = 0;
+
+  if (shResumen) {
+    const lr = shResumen.getLastRow();
+    if (lr >= 2) {
+      const data = shResumen.getRange(2, 1, lr - 1, COL.CLIENTE).getValues();
+      for (let i = 0; i < data.length; i++) {
+        const cliente = String(data[i][COL.CLIENTE - 1] || '').trim();
+        const codigo  = String(data[i][COL.CODIGO  - 1] || '').trim();
+        if (!_esCentroFantasmaBack(codigo, cliente)) continue;
+        let cambio = false;
+        if (cliente !== CLIENTE_NUEVO) {
+          shResumen.getRange(i + 2, COL.CLIENTE).setValue(CLIENTE_NUEVO);
+          cambio = true;
+        }
+        if (codigo !== CODIGO_NUEVO) {
+          shResumen.getRange(i + 2, COL.CODIGO).setValue(CODIGO_NUEVO).setNumberFormat('@');
+          cambio = true;
+        }
+        if (cambio) facturasActualizadas++;
+      }
+    }
+  }
+
+  if (shConfig) {
+    const lrC = Math.max(shConfig.getLastRow(), 1);
+    const filasGhost = [];
+    if (lrC >= 2) {
+      const vals = shConfig.getRange(2, 2, lrC - 1, 9).getValues();
+      for (let i = 0; i < vals.length; i++) {
+        const codigo  = String(vals[i][1] || '').trim();
+        const cliente = String(vals[i][2] || '').trim();
+        if (_esCentroFantasmaBack(codigo, cliente)) filasGhost.push(i + 2);
+      }
+    }
+    filasGhost.sort((a, b) => b - a).forEach(fila => {
+      shConfig.deleteRow(fila);
+      filasConfigBorradas++;
+    });
+    _asegurarColumnaEmpresa(shConfig);
+    const nextRow = Math.max(shConfig.getLastRow(), 1) + 1;
+    shConfig.getRange(nextRow, 2, 1, 9).setValues([[
+      '', CODIGO_NUEVO, CLIENTE_NUEVO, '', '', '', '', '', 'EMOAC'
+    ]]);
+    _configCache = null;
+  }
+
+  refrescarSeguimiento();
+  ui.alert(
+    '✓ Consolidación completada.\n\n' +
+    '· Facturas actualizadas: ' + facturasActualizadas + '\n' +
+    '· Filas Config borradas: ' + filasConfigBorradas + '\n\n' +
+    'Se dejó una única fila "Sin asignar" / "Sin código".'
+  );
+}
+
+function migrarConsumoASuministro() {
+  const ui = SpreadsheetApp.getUi();
+  const ok = ui.alert(
+    '🔁 Migrar "Consumo" → "Suministro"',
+    'Este proceso:\n\n' +
+    '  1. Renombra la hoja "Consumo" → "Suministro".\n' +
+    '  2. Cambia el valor de la columna Tipo de "CONSUMO" a "SUMINISTRO"\n' +
+    '     en todas las filas del Resumen.\n\n' +
+    'Es idempotente (se puede correr varias veces sin daño).\n\n¿Continuar?',
+    ui.ButtonSet.YES_NO
+  );
+  if (ok !== ui.Button.YES) return;
+
+  const ss = SpreadsheetApp.openById(SS_ID);
+
+  let hojaRenombrada = false;
+  const shViejo = ss.getSheetByName('Consumo');
+  const shNuevo = ss.getSheetByName('Suministro');
+  if (shViejo && !shNuevo) {
+    shViejo.setName('Suministro');
+    hojaRenombrada = true;
+  }
+
+  let filasMigradas = 0;
+  const sh = ss.getSheetByName(HOJA_RESUMEN);
+  if (sh) {
+    const lr = sh.getLastRow();
+    if (lr >= 2) {
+      const rango = sh.getRange(2, COL.TIPO, lr - 1, 1);
+      const vals = rango.getValues();
+      let cambio = false;
+      const nuevos = vals.map(r => {
+        if (String(r[0] || '').trim().toUpperCase() === 'CONSUMO') {
+          cambio = true; filasMigradas++;
+          return ['SUMINISTRO'];
+        }
+        return [r[0]];
+      });
+      if (cambio) rango.setValues(nuevos);
+    }
+  }
+
+  refrescarSeguimiento();
+  ui.alert(
+    '✓ Migración completada.\n\n' +
+    '· Hoja renombrada: ' + (hojaRenombrada ? 'sí (Consumo → Suministro)' : 'no (ya estaba o no existía)') + '\n' +
+    '· Facturas migradas a "SUMINISTRO": ' + filasMigradas
+  );
+}
+
+// ============================================================
+//  SEMILLA DE LA HOJA CONFIG
+// ============================================================
+function _initConfig(sh) {
+  sh.clear();
+  const hdr = ['Periodo', 'RUT', 'Código', 'Cliente', 'Empalme Suministro', 'Empalme Peaje', 'DriveOp', 'DriveCom', 'Rut (legacy)', 'Empresa', 'Códigos legado'];
+  sh.getRange(1, 1, 1, hdr.length).setValues([hdr]);
+  sh.getRange(1, 1, 1, hdr.length).setFontWeight('bold').setBackground('#1e293b').setFontColor('#ffffff');
+  if (PERIODOS_SEED.length) {
+    sh.getRange(2, 1, PERIODOS_SEED.length, 1).setValues(PERIODOS_SEED.map(p => [p]));
+    sh.getRange(2, 1, PERIODOS_SEED.length, 1).setNumberFormat('@');
+  }
+  if (CENTROS_SEED.length) {
+    sh.getRange(2, 2, CENTROS_SEED.length, 10).setValues(
+      CENTROS_SEED.map(c => [
+        c.rut || '', c.codigo || '', c.cliente || '',
+        c.empConsumo || '', c.empPeaje || '',
+        c.driveOp || '', c.driveCom || '', '',
+        c.empresa || 'EMOAC',
+        c.codigosLegado || ''         // ← columna K
+      ])
+    );
+  }
+  sh.setColumnWidth(1, 100); sh.setColumnWidth(3, 120); sh.setColumnWidth(4, 220);
+  sh.setColumnWidth(5, 140); sh.setColumnWidth(6, 140); sh.setColumnWidth(7, 280);
+  sh.setColumnWidth(8, 280); sh.setColumnWidth(9, 140); sh.setColumnWidth(10, 120);
+  sh.setColumnWidth(11, 220);
+  sh.setFrozenRows(1);
+}
+
+// ============================================================
+//  HELPERS INTERNOS DEL PROCESADOR MASIVO
+//  (usados por _ejecutarLotePDF, _finalizarProcesamientoPDF
+//   y _procesarUnPDFTransicion — no se exponen al frontend)
+// ============================================================
+
+// ─── Asegura que exista la fila fantasma "Sin asignar / Sin código"
+//     en la hoja Config antes de procesar un lote masivo. ───
+function asegurarCentroTemporal() {
+  const CODIGO_TEMP  = 'Sin código';
+  const CLIENTE_TEMP = 'Sin asignar';
+  const ss = SpreadsheetApp.openById(SS_ID);
+  let sh = ss.getSheetByName(HOJA_CONFIG);
+  if (!sh) {
+    _configCache = null;
+    leerConfig();
+    sh = ss.getSheetByName(HOJA_CONFIG);
+  }
+  const lr = Math.max(sh.getLastRow(), 1);
+  if (lr >= 2) {
+    const vals = sh.getRange(2, 3, lr - 1, 2).getValues();
+    for (let i = 0; i < vals.length; i++) {
+      const c = String(vals[i][0] || '').trim();
+      const n = String(vals[i][1] || '').trim();
+      // Reconoce cualquier variante previa (TEMP / ⚠️ Sin asignar / Sin asignar)
+      if (_esCentroFantasmaBack(c, n)) {
+        _configCache = null;
+        return { ok: true, codigo: c || CODIGO_TEMP, cliente: n || CLIENTE_TEMP };
+      }
+    }
+  }
+  _asegurarColumnaEmpresa(sh);
+  const nextRow = lr + 1;
+  sh.getRange(nextRow, 2, 1, 9).setValues([[
+    '', CODIGO_TEMP, CLIENTE_TEMP, '', '', '', '', '', 'EMOAC'
+  ]]);
+  _configCache = null;
+  return { ok: true, codigo: CODIGO_TEMP, cliente: CLIENTE_TEMP };
+}
+
+// ─── Rectifica TODOS los campos de una factura existente a partir de
+//     los datos extraídos por el parser. No toca F.Recep Consumo /
+//     F.Recep Peaje salvo que el caller las pase explícitamente. ───
+function actualizarFacturaDesdePDF(datos, idDrive, tsProcesado) {
+  if (!datos || !datos.numero) return { ok: false, error: 'Falta el N° de factura' };
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  const data = sh.getDataRange().getValues();
+  const numBuscado = String(datos.numero).trim();
+  const tipoNuevo  = String(datos.tipo || '').toUpperCase();
+
+  // ─── Localizar la fila por N° Factura (identificador único) ───
+  let fila = -1;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][COL.NUMERO - 1]).trim() === numBuscado) { fila = i + 1; break; }
+  }
+  if (fila === -1) return { ok: false, error: 'Factura no encontrada: ' + numBuscado };
+
+  const campos = [];
+  const _track = (col, fn) => { if (fn()) campos.push(col); };
+
+  if (['SUMINISTRO','PEAJE','UNIFICADA','ARRIENDO_MEDIDOR'].indexOf(tipoNuevo) !== -1) {
+    sh.getRange(fila, COL.TIPO).setValue(tipoNuevo); campos.push(COL.TIPO);
+  }
+
+  // Centro de costo también se rectifica.
+  // ─── Rectificación de cliente / código ─────────────────────────
+  //  Si el llamador envía `cliente` (aunque sea "") se actualiza el
+  //  cliente, y se actualiza el código en el mismo paso (incluso a
+  //  vacío, para evitar que un código viejo quede huérfano cuando el
+  //  centro destino no tiene código). Si `cliente` viene vacío, no se
+  //  toca el centro: el llamador indicó que no hay info para decidir.
+  if (datos.cliente) {
+    const cCli = sh.getRange(fila, COL.CLIENTE);
+    cCli.setValue(String(datos.cliente).trim());
+    campos.push(COL.CLIENTE);
+
+    const cCod = sh.getRange(fila, COL.CODIGO);
+    const codNuevo = String(datos.codigo || '').trim();
+    cCod.setValue(codNuevo).setNumberFormat('@');
+    campos.push(COL.CODIGO);
+  }
+
+  // Período: setValue con formato texto para no perder ceros.
+  if (datos.periodo && /^\d{4}-\d{2}$/.test(String(datos.periodo).trim())) {
+    const c = sh.getRange(fila, COL.PERIODO);
+    c.setValue(String(datos.periodo).trim());
+    c.setNumberFormat('@');
+    campos.push(COL.PERIODO);
+  }
+
+  _track(COL.KWH,         () => _setCeldaNum(sh, fila, COL.KWH,         datos.kwh));
+  _track(COL.SUM,         () => _setCeldaNum(sh, fila, COL.SUM,         datos.sum));
+  _track(COL.PEAJE,       () => _setCeldaNum(sh, fila, COL.PEAJE,       datos.peaje));
+  _track(COL.INT,         () => _setCeldaNum(sh, fila, COL.INT,         datos.intereses));
+  _track(COL.INT_PEAJE,   () => _setCeldaNum(sh, fila, COL.INT_PEAJE,   datos.intPeaje));
+  _track(COL.TOTAL,       () => _setCeldaNum(sh, fila, COL.TOTAL,       datos.total));
+  _track(COL.FECHA_EMISION, () => _setCeldaFecha(sh, fila, COL.FECHA_EMISION, datos.fechaEmision));
+  _track(COL.FECHA_VENC,    () => _setCeldaFecha(sh, fila, COL.FECHA_VENC,    datos.fechaVencimiento));
+
+  // ⚠ F.Recep Consumo / F.Recep Peaje: sólo se escriben si el caller las
+  //   pasa EXPLÍCITAMENTE y no vacías. El procesador masivo pasa '' para
+  //   ambas, por lo que nunca pisa una fecha ya registrada por el usuario.
+  if (datos.fechaConsumo != null && datos.fechaConsumo !== '') {
+    _track(COL.FECHA_SUMINISTRO, () => _setCeldaFecha(sh, fila, COL.FECHA_SUMINISTRO, datos.fechaConsumo));
+  }
+  if (datos.fechaPeaje != null && datos.fechaPeaje !== '') {
+    _track(COL.FECHA_PEAJE, () => _setCeldaFecha(sh, fila, COL.FECHA_PEAJE, datos.fechaPeaje));
+  }
+
+  let idFinal = '';
+  if (idDrive) {
+    const c = sh.getRange(fila, COL.PDF_ID);
+    c.setValue(String(idDrive).trim()).setNumberFormat('@');
+    idFinal = idDrive; campos.push(COL.PDF_ID);
+  }
+
+  const cTs = sh.getRange(fila, COL.PROCESADO_MASIVO);
+  cTs.setValue(tsProcesado instanceof Date ? tsProcesado : new Date());
+  cTs.setNumberFormat('yyyy-mm-dd hh:mm');
+  campos.push(COL.PROCESADO_MASIVO);
+
+  return { ok: true, fila: fila, campos: campos, idDrive: idFinal };
+}
+
+// ─── Lee la fila de una factura por N° y devuelve su PDF_ID y
+//     timestamp de procesamiento. Usado para decidir si hay que
+//     reemplazar el PDF o sólo rectificar los campos. ───
+function obtenerInfoFactura(numero, tipo) {
+  if (!numero) return { ok: false, error: 'Falta N° de factura' };
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  if (!sh) return { ok: false, error: 'No existe hoja Resumen' };
+  const data = sh.getDataRange().getValues();
+  const numBuscado = String(numero).trim();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][COL.NUMERO - 1]).trim() !== numBuscado) continue;
+    const fila = i + 1;
+    const pdfId = String(data[i][COL.PDF_ID - 1] || '').trim();
+    const tsRaw = data[i][COL.PROCESADO_MASIVO - 1];
+    const ts = (tsRaw instanceof Date && !isNaN(tsRaw.getTime())) ? tsRaw : null;
+    return { ok: true, fila: fila, pdfId: pdfId, procesadoMasivo: ts };
+  }
+  return { ok: false, error: 'Factura no encontrada' };
+}
+
+// ─── Setters genéricos usados por actualizarFacturaDesdePDF ───
+function _setCeldaNum(sh, fila, col, val) {
+  if (val === undefined || val === null || val === '') return false;
+  const n = Number(val);
+  if (!isFinite(n) || n <= 0) return false;
+  sh.getRange(fila, col).setValue(n);
+  return true;
+}
+function _setCeldaFecha(sh, fila, col, iso) {
+  if (!iso) return false;
+  const s = String(iso).trim();
+  const c = sh.getRange(fila, col);
+  if (SENTINELAS.indexOf(s) !== -1) {
+    c.setNumberFormat('@');
+    c.setValue(s);
+    return true;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const p = s.split('-').map(Number);
+  c.setNumberFormat('dd/mm/yyyy');
+  c.setValue(new Date(p[0], p[1] - 1, p[2]));
+  return true;
+}
+function _setCeldaTexto(sh, fila, col, val) {
+  if (val === undefined || val === null) return false;
+  const s = String(val).trim();
+  if (!s) return false;
+  sh.getRange(fila, col).setValue(s).setNumberFormat('@');
+  return true;
+}

@@ -3,25 +3,25 @@
  *  BACKEND — Seguimiento Facturación Electricidad
  *  · API + Config + Drive + OCR + Gemini (último recurso)
  *  · Procesador masivo de PDFs (v5)
+ *  · Procesador horario · carpeta de transición
  *  · Diagnóstico detallado en Logger
+ *
+ *  v2026-10 — Simplificación:
+ *    · Se eliminaron las columnas "Otros" y "Otros Peaje" del
+ *      Resumen. Los montos se consolidan ahora en "Sum. Neto"
+ *      y "Peaje" respectivamente.
+ *    · El parser EMOAC suma 691041 directamente a fPeaje; el
+ *      flag ARRIENDO_MEDIDOR se sigue activando por texto de fila.
+ *    · El Dashboard ya no muestra la serie "Otros".
  * ============================================================
  */
 
-// ============================================================
-//  🔑  GEMINI API KEY — MANTENIMIENTO MANUAL
-//  Obtén la clave en https://aistudio.google.com/apikey
-//  Si se deja vacía, el sistema usa sólo el pipeline OCR.
-// ============================================================
-const GEMINI_API_KEY = 'AQ.____Ab8RN6JAjxmzYxMa2TApr4-ykoV1R6ItLH5UlFV4dDiRXFTnDw';   
-
+const GEMINI_API_KEY = 'AQ.____Ab8RN6JAjxmzYxMa2TApr4-ykoV1R6ItLH5UlFV4dDiRXFTnDw';
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_TIMEOUT = 90;
 const GEMINI_MAX_BYTES_INLINE = 20 * 1024 * 1024;
+const MANUAL_VERSION = '20261009.002';
 
-// ─── Estado de cuota Drive OCR ───
-//  Cuando Drive OCR devuelve "User rate limit exceeded for OCR",
-//  guardamos una marca temporal para no seguir intentándolo en cada
-//  PDF del lote. Se reintenta automáticamente tras el reset diario.
 const PROP_KEY_DRIVE_OCR_BLOQUEADO = 'EMOAC_DRIVE_OCR_BLOQUEADO_HASTA';
 let _DRIVE_OCR_BLOQUEADO_EN_MEMORIA = false;
 
@@ -37,7 +37,6 @@ function _driveOcrEstaBloqueado() {
       _DRIVE_OCR_BLOQUEADO_EN_MEMORIA = true;
       return true;
     }
-    // Expiró → limpiar
     PropertiesService.getScriptProperties()
       .deleteProperty(PROP_KEY_DRIVE_OCR_BLOQUEADO);
     return false;
@@ -46,7 +45,6 @@ function _driveOcrEstaBloqueado() {
 
 function _bloquearDriveOcrPorCuota(motivo) {
   _DRIVE_OCR_BLOQUEADO_EN_MEMORIA = true;
-  // Reintentar a las 05:00 hora local del día siguiente
   const ahora = new Date();
   const manana = new Date(ahora.getFullYear(), ahora.getMonth(), ahora.getDate() + 1, 5, 0, 0, 0);
   try {
@@ -73,19 +71,24 @@ const HOJA_ARRIENDO = 'Arriendo Medidor';
 const HOJA_CONFIG = 'Config';
 const ARCHIVO_HTML = 'Frontend';
 
-// ─── Versión del manual de usuario ───
-//  Fuente única de verdad. Se inyecta en el HTML al servirlo
-//  (ver obtenerHTMLManual), así no hay que editar el HTML cuando
-//  cambie la versión.
-const MANUAL_VERSION = '20261002.227';
-
+// ─── Estructura del Resumen (17 columnas) ───
+//  Se eliminaron OTROS (antes 10) y OTROS_PEAJE (antes 12).
+//  Los montos correspondientes se consolidan en SUM y PEAJE.
 const COL = {
   NUMERO: 1, CODIGO: 2, CLIENTE: 3, PERIODO: 4, TIPO: 5,
-  KWH: 6, SUM: 7, PEAJE: 8, INT: 9, OTROS: 10, INT_PEAJE: 11, OTROS_PEAJE: 12, TOTAL: 13,
-  FECHA_SUMINISTRO: 14, FECHA_PEAJE: 15, FECHA_EMISION: 16, FECHA_VENC: 17,
-  PDF_ID: 18, PROCESADO_MASIVO: 19
+  KWH: 6, SUM: 7, PEAJE: 8, INT: 9,
+  INT_PEAJE: 10, TOTAL: 11,
+  FECHA_SUMINISTRO: 12, FECHA_PEAJE: 13, FECHA_EMISION: 14, FECHA_VENC: 15,
+  PDF_ID: 16, PROCESADO_MASIVO: 17
 };
-
+/* ============================================================
+ *  PROCESADOR MASIVO DE PDFs — constantes
+ * ============================================================ */
+const HOJA_PDF_PROCESADOS   = '_PDF_Procesados';
+const TIEMPO_MAX_MS         = 5 * 60 * 1000;
+const PROP_KEY_ESTADO_PDF   = 'EMOAC_PDF_STATE_V1';
+const ESTADOS_PROCESADOS    = { ok: 1, rectificada: 1 };
+const ESTADOS_REINTENTABLES = { error_ocr: 1, error_parseo: 1 };
 const DIA_RECEPCION = 18;
 
 const PERIODOS_SEED = [
@@ -125,16 +128,14 @@ function _esTextoBasuraBack(txt) {
 
 // ============================================================
 //  Detector de "centro fantasma" (Sin asignar / TEMP)
-//  Sirve para excluirlo de las hojas de seguimiento y de
-//  cualquier listado. NO afecta los datos del Resumen.
 // ============================================================
 function _esCentroFantasmaBack(codigo, cliente) {
   const c = String(codigo || '').trim().toUpperCase();
   const n = String(cliente || '').trim().toUpperCase();
   if (c === 'TEMP') return true;
-  if (c.indexOf('SIN C') === 0) return true;   // "Sin código"
+  if (c.indexOf('SIN C') === 0) return true;
   if (n.indexOf('SIN ASIGNAR') !== -1) return true;
-  if (n.indexOf('\u26A0') !== -1) return true; // ⚠
+  if (n.indexOf('\u26A0') !== -1) return true;
   return false;
 }
 
@@ -152,23 +153,6 @@ function _parseFechaDMY(str) {
   }
   mm = String(str).match(/(\d{4})[-\/\.](\d{1,2})[-\/\.](\d{1,2})/);
   if (mm) return mm[1] + '-' + String(parseInt(mm[2], 10)).padStart(2, '0') + '-' + String(parseInt(mm[3], 10)).padStart(2, '0');
-  return '';
-}
-
-function _extraerFechaTras(txt, etiqueta, tolerante) {
-  const gap = tolerante ? 150 : 40;
-  let re = new RegExp(etiqueta + '[^\\d\\n]{0,' + gap + '}(\\d{1,2}\\s*[-\\/\\.]\\s*\\d{1,2}\\s*[-\\/\\.]\\s*\\d{2,4})', 'i');
-  let mm = txt.match(re);
-  if (mm) return mm[1];
-  re = new RegExp(etiqueta + '[\\s\\S]{0,' + gap + '}?(\\d{1,2}\\s*[-\\/\\.]\\s*\\d{1,2}\\s*[-\\/\\.]\\s*\\d{2,4})', 'i');
-  mm = txt.match(re);
-  if (mm) return mm[1];
-  const idx = txt.search(new RegExp(etiqueta, 'i'));
-  if (idx >= 0) {
-    const sub = txt.slice(idx + etiqueta.length, idx + etiqueta.length + 300);
-    const mF = sub.match(/(\d{1,2}\s*[-\/\.]\s*\d{1,2}\s*[-\/\.]\s*\d{2,4})/);
-    if (mF) return mF[1];
-  }
   return '';
 }
 
@@ -190,21 +174,6 @@ function _inputANumero(v) {
 
 /* ═══════════════════════════════════════════════════════════════
  *  ★★★  BLOQUE DE PARSING — ÚNICO PUNTO DE MODIFICACIÓN  ★★★
- *
- *  Contrato de cada parser:
- *    · Recibe texto OCR CRUDO (String).
- *    · Devuelve objeto con:
- *        { fDTE, fEmpresa, fNumero, fCodigo, fRut, fPeriodo,
- *          fEmision, fVencimiento, fKwh, fSum, fPeaje, fInt,
- *          fIntPeaje, fOtros, fOtrosPeaje, fTotal, fTipo }
- *
- *  Funciones:
- *    · _detectarProveedor(t0)       → 'EMOAC' | 'ACIERTA'
- *    · _parsearEMOACDTE(t0)         → Parser EMOAC
- *    · _parsearAciertaDTE(t0)       → Parser Acierta
- *    · _parsearFacturaCompleta(t0)  → Router
- *
- *  El vencimiento NUNCA se calcula — sólo se extrae del PDF.
  * ═══════════════════════════════════════════════════════════════ */
 
 function _detectarProveedor(t0) {
@@ -218,10 +187,6 @@ function _detectarProveedor(t0) {
   return 'EMOAC';
 }
 
-// ============================================================
-//  Helper: convierte "OCHO MILLONES TRESCIENTOS DOS MIL
-//  TREINTA Y TRES Pesos chilenos" → 8302033
-// ============================================================
 function _numeroEnPalabrasAPeso(texto) {
   if (!texto) return 0;
   const t = String(texto).toUpperCase()
@@ -264,32 +229,361 @@ function _numeroEnPalabrasAPeso(texto) {
   return total;
 }
 
-// ============================================================
-//  Busca una fecha DD-MM-YYYY (formato chileno) junto a una
-//  etiqueta. Asume que el OCR siempre produce las etiquetas
-//  literales indicadas (normalizadas por NFD, sin acentos).
-// ============================================================
-// ============================================================
-//  Extrae emisión y vencimiento del encabezado.
-//  Estrategia SEMÁNTICA (no depende del orden de las etiquetas
-//  ni del layout de tabla, que puede variar en el OCR):
-//    1. Localizar la posición del primer "FECHA EMISIÓN" o
-//       "FECHA VENCIMIENTO" en el texto.
-//    2. Extraer TODAS las fechas DD-MM-YYYY en los 1500 chars
-//       siguientes.
-//    3. Desduplicar y ordenar cronológicamente.
-//       · La menor → emisión.
-//       · La mayor → vencimiento.
-//  En toda factura chilena: emisión ≤ vencimiento. Es invariante.
-// ============================================================
+function _continuarEjecucionPDF() {
+  const estado = _leerEstadoPDF();
+  if (!estado) { _limpiarTriggersPDF(); return; }
+  let resultado;
+  try { resultado = _ejecutarLotePDF(estado); }
+  catch (e) { Logger.log('Error continuación: ' + e.message); _borrarEstadoPDF(); _limpiarTriggersPDF(); return; }
+  if (resultado.tiempoAgotado) { _programarSiguienteEjecucionPDF(); return; }
+  _borrarEstadoPDF();
+  _limpiarTriggersPDF();
+  const msg = _resumenResultado(resultado, estado) + '\n\n✅ Procesamiento completo.';
+  try { SpreadsheetApp.getActiveSpreadsheet().toast('✅ ' + resultado.ok + ' facturas · ' + resultado.errores + ' errores', 'Procesamiento masivo', 30); } catch (e) { }
+  try {
+    const email = Session.getEffectiveUser().getEmail();
+    MailApp.sendEmail({ to: email, subject: '✅ Procesamiento masivo terminado', body: msg + '\n\nRevisa "' + HOJA_PDF_PROCESADOS + '" para el detalle.' });
+  } catch (e) { Logger.log('No se pudo enviar email: ' + e.message); }
+  Logger.log(msg);
+}
+
+function _guardarEstadoPDF(estado) { PropertiesService.getScriptProperties().setProperty(PROP_KEY_ESTADO_PDF, JSON.stringify(estado)); }
+function _leerEstadoPDF() {
+  const s = PropertiesService.getScriptProperties().getProperty(PROP_KEY_ESTADO_PDF);
+  if (!s) return null;
+  try { return JSON.parse(s); } catch (e) { return null; }
+}
+function _borrarEstadoPDF() { PropertiesService.getScriptProperties().deleteProperty(PROP_KEY_ESTADO_PDF); }
+function _programarSiguienteEjecucionPDF() {
+  _limpiarTriggersPDF();
+  ScriptApp.newTrigger('_continuarEjecucionPDF').timeBased().after(60 * 1000).create();
+}
+function _limpiarTriggersPDF() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === '_continuarEjecucionPDF') {
+      try { ScriptApp.deleteTrigger(t); } catch (e) { }
+    }
+  });
+}
+
+function _registrarPDFEnDup(dupRegistro, numero, tipo, id, path, paginas) {
+  if (!dupRegistro || !id) return;
+  const num = String(numero || '').trim();
+  const tpo = String(tipo || '').toUpperCase();
+  if (!num || !tpo) return;
+  const key = num + '|' + tpo;
+  if (!dupRegistro[key]) dupRegistro[key] = [];
+  if (dupRegistro[key].some(a => a.id === id)) return;
+  dupRegistro[key].push({ id, path: path || '', paginas: Number(paginas) || 0 });
+}
+
+function _calcularDuplicados(dupRegistro) {
+  const resultado = [];
+  Object.entries(dupRegistro || {}).forEach(([key, archivos]) => {
+    if (!archivos || archivos.length < 2) return;
+    const [numero, tipo] = key.split('|');
+    resultado.push({ numero, tipo, archivos: archivos.slice().sort((a, b) => a.id.localeCompare(b.id)) });
+  });
+  resultado.sort((a, b) => a.numero.localeCompare(b.numero));
+  return resultado;
+}
+function _ejecutarLotePDF(estado) {
+  const folderId = parseDriveId(estado.url);
+  if (!folderId) throw new Error('URL/ID inválido.');
+  let folder;
+  try { folder = DriveApp.getFolderById(folderId); }
+  catch (e) { throw new Error('No se pudo acceder a la carpeta: ' + e.message); }
+
+  const pdfs = [];
+  _listarPDFsRecursivo(folder, pdfs, '');
+  const totalEncontrados = pdfs.length;
+
+  const reg = cargarRegistroPDFs();
+  let lista = pdfs.slice();
+  let totalFiltradosPorRegistro = 0;
+  if (!estado.incluirProcesados) {
+    const antes = lista.length;
+    lista = lista.filter(p => {
+      let id;
+      try { id = p.file.getId(); } catch (e) { return false; }
+      const prev = reg[id];
+      return !prev || !ESTADOS_PROCESADOS[prev.estado];
+    });
+    totalFiltradosPorRegistro = antes - lista.length;
+  }
+
+  lista.sort((a, b) => {
+    let da, db;
+    try { da = a.file.getDateCreated().getTime(); } catch (e) { da = 0; }
+    try { db = b.file.getDateCreated().getTime(); } catch (e) { db = 0; }
+    return db - da;
+  });
+
+  const inicio = Date.now();
+  const delayMs = estado.modo === 3 ? 120000 : 0;
+  const resultado = {
+    total: lista.length, procesados: 0, saltados: 0,
+    ok: 0, duplicadas: 0, rectificadas: 0, revManual: 0, errores: 0,
+    restantes: 0, tiempoAgotado: false, detalle: [], duplicados: [],
+    totalEncontrados, totalFiltradosPorRegistro,
+    gemini: !!estado.gemini
+  };
+  const dupRegistro = {};
+
+  asegurarCentroTemporal();
+  const existentes = leerResumen();
+  const config = leerConfig();
+
+  for (let i = 0; i < lista.length; i++) {
+    if (Date.now() - inicio > TIEMPO_MAX_MS) {
+      resultado.tiempoAgotado = true;
+      resultado.restantes = lista.length - i;
+      break;
+    }
+    const item = lista[i];
+    let fileId;
+    try { fileId = item.file.getId(); } catch (e) { fileId = ''; }
+
+    if (fileId && !estado.incluirProcesados) {
+      const prev = reg[fileId];
+      if (prev && ESTADOS_PROCESADOS[prev.estado]) { resultado.saltados++; continue; }
+    }
+
+    if (delayMs > 0 && resultado.procesados > 0) {
+      if (Date.now() - inicio + delayMs > TIEMPO_MAX_MS) {
+        resultado.tiempoAgotado = true;
+        resultado.restantes = lista.length - i;
+        break;
+      }
+      Utilities.sleep(delayMs);
+    }
+
+    const r = _procesarUnPDF(item, existentes, config, true, {
+      reprocesarRecientes: !!estado.reprocesarRecientes,
+      dupRegistro
+    });
+
+    if (fileId) {
+      const _detalleFinal = [r.detalle, r.diag].filter(Boolean).join('  ||  ');
+      reg[fileId] = {
+        path: item.path,
+        estado: r.estado,
+        detalle: _detalleFinal,
+        ts: new Date().toISOString(),
+        numero: r.numeroFactura || ''
+      };
+    }
+
+    if (r.estado === 'ok') resultado.ok++;
+    else if (r.estado === 'rectificada') resultado.rectificadas++;
+    else if (r.estado === 'rev_manual') resultado.revManual++;
+    else if (r.estado === 'duplicada') resultado.duplicadas++;
+    else resultado.errores++;
+    resultado.procesados++;
+
+    if (r.estado === 'rev_manual') resultado.detalle.push({ archivo: item.path, revision: r.detalle, warning: r.warning });
+    else if (r.detalle && r.estado !== 'ok' && r.estado !== 'duplicada') resultado.detalle.push({ archivo: item.path, error: r.detalle });
+    else if (r.warning) resultado.detalle.push({ archivo: item.path, warning: r.warning });
+
+    guardarRegistroPDFs(reg);
+  }
+
+  guardarRegistroPDFs(reg);
+  refrescarSeguimiento();
+  resultado.duplicados = _calcularDuplicados(dupRegistro);
+  Logger.log(JSON.stringify(resultado, null, 2));
+  return resultado;
+}
+
+function _resumenResultado(r, estado) {
+  const lineas = [];
+  const modoTxt = estado.modo === 1 ? 'una vez' : estado.modo === 3 ? 'indefinido con pausas' : ('modo ' + estado.modo);
+  const coberturaTxt = estado.incluirProcesados ? 'TODOS' : 'solo NO procesados';
+  const motorTxt = estado.gemini ? 'OCR primero · Gemini como último recurso' : 'OCR tradicional';
+  lineas.push('📊 Resultado del lote');
+  lineas.push('');
+  lineas.push('Modo:      ' + modoTxt);
+  lineas.push('Cobertura: ' + coberturaTxt);
+  lineas.push('Motor:     ' + motorTxt);
+  lineas.push('');
+  lineas.push('PDFs en carpeta:      ' + (r.totalEncontrados != null ? r.totalEncontrados : '?'));
+  if (r.totalFiltradosPorRegistro > 0) lineas.push('  · Ya procesados:    ' + r.totalFiltradosPorRegistro);
+  lineas.push('PDFs en lote:         ' + r.total);
+  lineas.push('Saltados (registro):  ' + r.saltados);
+  lineas.push('Procesados:          ' + r.procesados);
+  lineas.push('  · Creadas:         ' + r.ok);
+  lineas.push('  · Rectificadas:    ' + (r.rectificadas || 0));
+  lineas.push('  · Rev. manual:     ' + (r.revManual || 0));
+  lineas.push('  · Duplicadas:      ' + r.duplicadas);
+  lineas.push('  · Errores:         ' + r.errores);
+  if (r.tiempoAgotado) { lineas.push(''); lineas.push('⏸️ Restantes: ' + r.restantes); }
+
+  const conProblemas = (r.detalle || []).filter(d => d.error || d.warning || d.revision);
+  if (conProblemas.length) {
+    lineas.push('');
+    lineas.push('Detalle (primeros 15):');
+    conProblemas.slice(0, 15).forEach(d => {
+      lineas.push('· ' + d.archivo);
+      if (d.revision) { lineas.push('   [rev_manual] ' + (d.warning || '')); d.revision.split('\n').forEach(l => lineas.push('   ' + l)); }
+      else lineas.push('   ' + (d.error || d.warning));
+    });
+  }
+
+  const dups = (r.duplicados || []);
+  if (dups.length) {
+    lineas.push('');
+    lineas.push('🔍 Duplicados detectados:');
+    dups.forEach(d => {
+      lineas.push('');
+      lineas.push('  ' + d.numero + ' · ' + d.tipo);
+      d.archivos.forEach(a => lineas.push('    ' + a.id + ' (' + a.paginas + ' páginas)'));
+    });
+  }
+  return lineas.join('\n');
+}
+
+function _copiarYVincularPDF(file, numero, codigo, periodo, tipo, centro) {
+  const nombreEst = _construirNombreArchivoEstandar({
+    numero:  numero,
+    codigo:  codigo,
+    periodo: periodo,
+    tipo:    tipo
+  }, centro);
+
+  let idFinal = '';
+  let warning = '';
+
+  if (!(centro.driveOp || centro.driveCom)) {
+    return { ok: true, idFinal: '', warning: '' };
+  }
+
+  try {
+    const copia = copiarPDFDriveADestinos(file.getId(), centro.codigo, nombreEst);
+    if (copia.ok && copia.archivos && copia.archivos.length) {
+      idFinal = copia.archivos[0].id;
+      const vinc = vincularPDFDrive(numero, idFinal, nombreEst);
+      if (!vinc.ok && vinc.error) {
+        warning = 'PDF copiado pero no vinculado: ' + vinc.error;
+      }
+    } else if (!copia.ok) {
+      warning = 'PDF no copiado: ' + (copia.error || 'sin detalle');
+    }
+  } catch (e) {
+    warning = 'PDF no copiado: ' + e.message;
+  }
+
+  return { ok: !warning, idFinal, warning };
+}
+
+function _esReintentable(estado) { return !!ESTADOS_REINTENTABLES[estado]; }
+
+function mostrarRegistroPDFsUI() {
+  const ui = SpreadsheetApp.getUi();
+  const reg = cargarRegistroPDFs();
+  const total = Object.keys(reg).length;
+  if (!total) { ui.alert('El registro está vacío.'); return; }
+  const porEstado = {};
+  Object.values(reg).forEach(v => { porEstado[v.estado] = (porEstado[v.estado] || 0) + 1; });
+  const lineas = ['📋 Registro de PDFs procesados', '', 'Total: ' + total, ''];
+  Object.keys(porEstado).sort().forEach(k => lineas.push('  · ' + k + ': ' + porEstado[k]));
+  lineas.push('');
+  lineas.push('Detalle en la hoja oculta "' + HOJA_PDF_PROCESADOS + '".');
+  ui.alert(lineas.join('\n'));
+}
+
+function autorizarTodosLosScopes() {
+  DriveApp.getFiles();
+  Drive.Files.list({ maxResults: 1 });
+  SpreadsheetApp.getActiveSpreadsheet().getName();
+  const tmp = DocumentApp.create('tmp_auth_check');
+  DriveApp.getFileById(tmp.getId()).setTrashed(true);
+  PropertiesService.getScriptProperties().getKeys();
+  ScriptApp.getProjectTriggers();
+  UrlFetchApp.fetch('https://api.ocr.space/parse/image', {
+    method: 'post', payload: { apikey: 'helloworld', filetype: 'AUTO' }, muteHttpExceptions: true
+  });
+  UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+    method: 'get', muteHttpExceptions: true
+  });
+  Logger.log('✓ Autorización completa');
+  try { SpreadsheetApp.getUi().alert('✓ Permisos concedidos'); } catch (e) { }
+}
+function reautorizar() { autorizarTodosLosScopes(); }
+
+function normalizarAliasClientes() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Resumen Facturación');
+  const data = sh.getDataRange().getValues();
+  const MAPA = {
+    'Gildemeister (SB)': 'Gildemeister SB',
+    'StgoDowntown Torre 4 y 7 (4051)': 'StgoDowntown',
+    'StgoDowntown Torre 4 y 7 (4052)': 'StgoDowntown',
+    'COMUNIDAD EDIFICIO NERUDA': 'Neruda'
+  };
+  const COL_CLIENTE = 4;
+  let cambios = 0;
+  for (let i = 1; i < data.length; i++) {
+    const actual = String(data[i][COL_CLIENTE - 1] || '').trim();
+    if (MAPA[actual]) { sh.getRange(i + 1, COL_CLIENTE).setValue(MAPA[actual]); cambios++; }
+  }
+  SpreadsheetApp.getUi().alert('✓ Nombres normalizados: ' + cambios);
+}
+
+function previsualizarRenombradoPDFs() {
+  const ss = SpreadsheetApp.openById(SS_ID);
+  const sh = ss.getSheetByName(HOJA_RESUMEN);
+  if (!sh) { Logger.log('No existe "Resumen Facturación"'); return; }
+  const lr = Math.max(sh.getLastRow(), 1);
+  if (lr < 2) { Logger.log('Sin facturas'); return; }
+  const nCols = Math.max(sh.getLastColumn(), COL.PDF_ID);
+  const data  = sh.getRange(2, 1, lr - 1, nCols).getValues();
+  const lineas = [];
+  let conCambio = 0, papelera = 0, inaccesibles = 0, recuperables = 0;
+  data.forEach((fila, i) => {
+    const numero  = String(fila[COL.NUMERO - 1] || '').trim();
+    const codigo  = String(fila[COL.CODIGO - 1] || '').trim();
+    const periodo = String(fila[COL.PERIODO - 1] || '').trim();
+    const tipo    = String(fila[COL.TIPO - 1] || '').trim();
+    const pdfId   = String(fila[COL.PDF_ID - 1] || '').trim();
+    if (!pdfId || !numero) return;
+    const nombreNuevo = _construirNombreArchivoEstandar({ numero, codigo, periodo, tipo });
+    let file = null, motivo = '';
+    try {
+      file = DriveApp.getFileById(pdfId);
+      let trashed = false;
+      try { trashed = file.isTrashed(); } catch (e) {}
+      if (trashed) { file = null; motivo = 'EN PAPELERA'; }
+    } catch (e) { file = null; motivo = 'INACCESIBLE: ' + (e.message || e); }
+    if (!file) {
+      const busqueda = _buscarPDFEnDriveDelCentro(codigo, numero);
+      if (busqueda.ok && busqueda.encontrado) { recuperables++;
+        lineas.push('· Fila ' + (i + 2) + '  N° ' + numero + '  ⚠️ ' + motivo + '  →  auto-recuperable');
+        return;
+      }
+      if (motivo.indexOf('PAPELERA') !== -1) papelera++; else inaccesibles++;
+      lineas.push('· Fila ' + (i + 2) + '  N° ' + numero + '  ❌ ' + motivo);
+      return;
+    }
+    const actual = file.getName();
+    if (actual === nombreNuevo) return;
+    conCambio++;
+    lineas.push('· Fila ' + (i + 2) + '  N° ' + numero);
+    lineas.push('    de:  ' + actual);
+    lineas.push('    a:   ' + nombreNuevo);
+  });
+  const cab = ['🔍 Previsualización de renombrado','',
+    '· A renombrar:             ' + conCambio,
+    '· Auto-recuperables:       ' + recuperables,
+    '· En papelera (sin match): ' + papelera,
+    '· Inaccesibles:            ' + inaccesibles,''].join('\n');
+  Logger.log(cab + lineas.join('\n'));
+}
+
 function _extraerFechasEmiVen(txt) {
   if (!txt) return { emision: '', vencimiento: '' };
 
   const posEmi = txt.search(/FECHA\s*EMISI[OÓ0]N/i);
   const posVen = txt.search(/FECHA\s*VENCIMIENTO/i);
 
-  // Punto de partida: el primer label que aparezca.
-  // Si ninguno aparece, arrancamos del inicio del texto.
   let inicio = 0;
   if (posEmi >= 0 && posVen >= 0) inicio = Math.min(posEmi, posVen);
   else if (posEmi >= 0) inicio = posEmi;
@@ -310,7 +604,6 @@ function _extraerFechasEmiVen(txt) {
     }
   }
 
-  // Diagnóstico (queda en el log de Apps Script).
   try {
     Logger.log('[FECHAS] posEmi=' + posEmi + ' posVen=' + posVen +
       ' zona=' + JSON.stringify(zona.slice(0, 180)) +
@@ -322,15 +615,9 @@ function _extraerFechasEmiVen(txt) {
   const unicas = [...new Set(encontradas)].sort();
 
   if (unicas.length === 1) {
-    // Sólo una fecha: no podemos asegurar a qué campo pertenece.
-    // Asumimos emisión (suele ser la única que se imprime en muchos DTE).
     return { emision: unicas[0], vencimiento: '' };
   }
 
-  // ≥ 2 fechas: la menor es emisión, la mayor es vencimiento.
-  // Si todas las fechas son iguales (poco probable pero posible en OCR
-  // que sólo imprime una fecha repetida), dejar vencimiento vacío para
-  // no repetir el mismo valor en ambos campos.
   if (unicas.length >= 2 && unicas[0] === unicas[unicas.length - 1]) {
     return { emision: unicas[0], vencimiento: '' };
   }
@@ -427,13 +714,6 @@ function _parsearEMOACDTE(textoOriginal) {
   }
 
   // ─── 3) N° FACTURA ───
-  //  Se acota la búsqueda al encabezado superior (antes de "S.I.I.",
-  //  "NOMBRE" o "PEDIDO") para no confundir el N° real con la
-  //  referencia del pie:
-  //    "Nota De Débito Electrónica · Corrige Montos ·
-  //     Factura Electrónica N° 49285"
-  //  Se acepta 1..12 dígitos: las "NOTA DE DÉBITO/CRÉDITO ELECTRÓNICA"
-  //  de EMOAC usan N° cortos (ej. 628); los DTE corrientes usan 5-8.
   {
     const idxSII    = tN.search(/S\.?\s*I\.?\s*I\.?/i);
     const idxNombre = tN.search(/\bNOMBRE\s*:/i);
@@ -445,20 +725,16 @@ function _parsearEMOACDTE(textoOriginal) {
 
     let numero = '';
 
-    // 3.1) Tipo de documento + N° dentro del encabezado
     const m1 = cabecera.match(
       /(?:NOTA\s+DE\s+(?:D[EÉ]BITO|CR[EÉ]DITO)|FACTURA)\s+ELECTR[ÓO]NICA[\s\S]{0,80}?N[°ºoO0]?\s*[:\.\-\s]{0,8}0*(\d{1,12})/i
     );
     if (m1) numero = m1[1];
 
-    // 3.2) Fallback: cualquier "N° <numero>" dentro del encabezado
     if (!numero) {
       const m2 = cabecera.match(/N[°ºoO]\s*[:\.\-\s]{0,8}0*(\d{1,12})/);
       if (m2) numero = m2[1];
     }
 
-    // 3.3) Fallback final: patrones tradicionales (para DTE atípicos
-    //      que no pongan el N° antes de S.I.I. / NOMBRE / PEDIDO)
     if (!numero) {
       const patrones = [
         /(?:FOLIO|N[°ºo]?\s*(?:DE\s*)?FACTURA|FACTURA\s*N[°ºo]?|N[°ºo]?\s*DOCUMENTO|N[°ºo]?\s*DTE|N[°ºo]?\s*INTERNO)\s*:?\s*0*(\d{1,12})/i,
@@ -475,33 +751,19 @@ function _parsearEMOACDTE(textoOriginal) {
     }
   }
 
-  // ─── 4) FECHAS — sólo se extraen, nunca se calculan ───
+  // ─── 4) FECHAS ───
   {
     const _f = _extraerFechasEmiVen(tN);
     out.fEmision = _f.emision;
     out.fVencimiento = _f.vencimiento;
   }
 
-  // 🔎 Diagnóstico — quitar cuando funcione
-  try {
-    const ctxE = tN.match(/.{0,40}EMISI.{0,60}/i);
-    const ctxV = tN.match(/.{0,40}VENCIMIENTO.{0,60}/i);
-    Logger.log('[EMOAC FECHAS] emisión ctx: ' + (ctxE ? JSON.stringify(ctxE[0]) : '(no encontrado)'));
-    Logger.log('[EMOAC FECHAS] vencim. ctx: ' + (ctxV ? JSON.stringify(ctxV[0]) : '(no encontrado)'));
-    Logger.log('[EMOAC FECHAS] resultado: emi=' + out.fEmision + ' ven=' + out.fVencimiento);
-  } catch (e) { }
-
-  // ─── 5) PREPROCESADO DE LA TABLA DE CARGOS (SOLO PÁGINA 1) ───
-  //  Todo lo que sigue trabaja exclusivamente con la tabla oficial
-  //  CODIGO/DETALLE/CANTIDAD/PRECIO UNIT/TOTAL y el pie Afecto/Exento/
-  //  IVA/Total de la página 1. Nunca se usan "Mes de consumo", "Monto
-  //  neto", "Monto exento" ni "Total a pagar" (esos viven en el
-  //  reporte informativo de páginas siguientes).
+  // ─── 5) PREPROCESADO DE LA TABLA DE CARGOS ───
   let t = t0;
   t = t.replace(/([A-Za-zÁÉÍÓÚÑáéíóúñ])(\d)/g, '$1 $2');
   t = t.replace(/(\d)([A-Za-zÁÉÍÓÚÑáéíóúñ])/g, '$1 $2');
 
-  // ─── 6) PERÍODO — desde la línea de detalle "CODIGO ... / MES AÑO" ───
+  // ─── 6) PERÍODO ───
   const MESES_TXT = {
     ENERO: '01', FEBRERO: '02', MARZO: '03', ABRIL: '04', MAYO: '05', JUNIO: '06',
     JULIO: '07', AGOSTO: '08', SEPTIEMBRE: '09', SETIEMBRE: '09',
@@ -519,30 +781,19 @@ function _parsearEMOACDTE(textoOriginal) {
     }
   }
 
-  // ─── 7) MONTOS — por códigos 691xxx de la tabla oficial (página 1) ───
-  //  Suministro (afecto):        691020 ENERGIA, 691021 CARGO DEMANDA HP
-  //  Legales (cargo suministro): 691023 CEN, 691024 TRANSPORTE,
-  //                              691034 LEY 20.780, 691035 SERV.PUB BASE,
-  //                              691036 SERV.PUB FET
-  //  Peaje distribución (DX):    691029 COMPRA POTENCIA DX,
-  //                              691030 ENERGIA DX, 691032 POTENCIA
-  //                              SUMINISTRADA DX, 691038 CARGO FIJO DX,
-  //                              691039 CARGO POTENCIA HP DX
-  //  Intereses suministro:       691010
-  //  Intereses peaje (DX):       691040
-  //  Otros peaje (DX):           691041
-  // Suministro: 691020, 691021, 691024, 691035, 691036, 691023, 691034
+  // ─── 7) MONTOS — por códigos 691xxx ───
+  //  Simplificación: los montos de 691041 ("OTROS DX" / "ARRIENDO
+  //  MEDIDOR") se suman DIRECTAMENTE a fPeaje. El flag tieneArriendo
+  //  sólo sirve para clasificar el fTipo cuando la factura contiene
+  //  ese único cargo.
   const SUM = { '691020': 1, '691021': 1, '691024': 1, '691035': 1, '691036': 1 };
   const LEGALES = { '691023': 1, '691034': 1 };
-  // Peaje: 691029, 691030, 691032, 691038, 691039
   const PEAJE = { '691029': 1, '691030': 1, '691032': 1, '691038': 1, '691039': 1 };
-  // Arriendo medidor: 691041
-  const ARRIENDO = { '691041': 1 };
+  const COD_691041 = { '691041': 1 };
   const INT_SUM = { '691010': 1 };
   const INT_PEAJE = { '691040': 1 };
-  const OTROS_PEAJE = {};
 
-  let sum = 0, peaje = 0, intSum = 0, intPeaje = 0, otrosPeaje = 0, arriendo = 0, kwh = 0;
+  let sum = 0, peaje = 0, intSum = 0, intPeaje = 0, kwh = 0;
   let tieneSum = false, tienePeaje = false, tieneArriendo = false;
 
   const RE_NUM = /\d+(?:[.,]\d+)*/g;
@@ -554,10 +805,6 @@ function _parsearEMOACDTE(textoOriginal) {
 
   for (let ci = 0; ci < positions.length - 1; ci++) {
     let chunk = t.substring(positions[ci], positions[ci + 1]);
-    // Cortar el chunk cuando aparezca cualquier marcador de fin de fila.
-    // Se añaden "Nota De Débito" y "Corrige Montos" porque la nota de
-    // referencia al pie ("... Corrige Montos Factura Electrónica N° 49285")
-    // contiene un N° que el parser confundía con el monto del cargo.
     const corte = chunk.search(
       /\b(Afecto|Exento|IVA|Total[\s:$]|Son\s|Timbre|Verifique|Nota\s+De\s+D|Corrige\s+Montos)/i
     );
@@ -575,58 +822,53 @@ function _parsearEMOACDTE(textoOriginal) {
 
     if (SUM[cod] || LEGALES[cod]) { sum += total; tieneSum = true; }
     else if (PEAJE[cod]) { peaje += total; tienePeaje = true; }
-    else if (ARRIENDO[cod]) {
-      // 691041 sólo es Arriendo de Medidor si el texto de la fila lo dice.
-      // Si no, es un cargo de peaje (OTROS DX).
+    else if (COD_691041[cod]) {
+      // ────────────────────────────────────────────────────────────
+      //  REGLA DE NEGOCIO — 691041 (EMOAC)
+      // ────────────────────────────────────────────────────────────
+      //  El monto va SIEMPRE a fPeaje.
+      //
+      //  ⚠ IMPORTANTE — 691041 NO es siempre "Arriendo Medidor":
+      //    · "OTROS DX ..."        → cargo genérico de distribución.
+      //    · "ARRIENDO DE MEDIDOR" → arriendo propiamente tal.
+      //    · Sólo se activa tieneArriendo si el TEXTO lo dice
+      //      EXPLÍCITAMENTE. Eso permite clasificar la factura como
+      //      ARRIENDO_MEDIDOR cuando ese es el único cargo.
+      //    · En cualquier otro caso, la factura se clasifica como
+      //      PEAJE (tienePeaje = true).
+      // ────────────────────────────────────────────────────────────
+      peaje += total;
       const esArriendoMedidor = /ARRIENDO\s*(DE\s*)?MEDIDOR/i.test(chunk);
-      if (esArriendoMedidor) { arriendo += total; tieneArriendo = true; }
-      else                   { peaje    += total; tienePeaje    = true; }
+      if (esArriendoMedidor) tieneArriendo = true;
+      else                   tienePeaje    = true;
+      _logDiag('[EMOAC] 691041 → peaje=' + total +
+        ' · esArriendoMedidor=' + esArriendoMedidor +
+        ' · chunk=' + JSON.stringify(chunk.slice(0, 160)));
     }
-    else if (OTROS_PEAJE[cod]) { otrosPeaje += total; }
     else if (INT_SUM[cod]) { intSum += total; }
     else if (INT_PEAJE[cod]) { intPeaje += total; }
 
-    // El kWh puede venir de la fila de suministro (691020)
-    // o de la fila de peaje (691030 ENERGIA DX).
     if ((cod === '691020' || cod === '691030') && !kwh) {
-      // La cantidad precede a la palabra KWH en el layout de EMOAC.
-      // Ejemplos:
-      //   "ENERGIA 2287 / AGOSTO 2026 181.618,540 KWH ..."
-      //   "ENERGIA DX 9458517 / JUNIO 2026 23.244,400 KWH ..."
-      // El patrón captura el número en notación chilena seguido de KWH.
       const mK = chunk.match(/(\d{1,3}(?:\.\d{3})*(?:,\d+)?)\s*KWH/i);
       if (mK) kwh = _inputANumero(mK[1]);
     }
   }
 
-  // ─── 8) TOTAL — extraído SOLO de la página 1, NUNCA calculado ───
-  //  La página 1 contiene la única fuente oficial del total:
-  //    · "Total$22.530.025"  (pegado al $, sin espacio)
-  //    · o "Total: $22.530.025" / "Total $ 22.530.025"
-  //  Además, al final de la página 1 aparece SIEMPRE:
-  //    · "Son … Pesos chilenos"  (número en palabras)
-  //  Las páginas informativas (2, 3, …) traen "Total a pagar" y
-  //  "Subtotal suministro" con valores que pueden diferir del oficial
-  //  (por redondeo o por desfase del reporte). Por eso acotamos la
-  //  búsqueda al bloque de página 1: desde el inicio hasta el texto
-  //  "Son … Pesos chilenos" o el Timbre SII.
+  // ─── 8) TOTAL ───
   let totalPagar = 0;
   {
-    // Delimitar zona de página 1
     let zonaPag1 = tN;
     const idxSon    = tN.search(/\bSon\s+[A-ZÁÉÍÓÚÑ\s]+\s+Pesos\s+chilenos/i);
     const idxTimbre = tN.search(/Timbre\s+Electr[oó]nico|Res\.\s*80\s+del/i);
     const cortes = [idxSon, idxTimbre].filter(x => x > 0);
     if (cortes.length) zonaPag1 = tN.slice(0, Math.min(...cortes));
 
-    // 1) "Total" con $ obligatorio, dentro de la página 1
     const m1 = zonaPag1.match(/\bTotal\s*[:\-]?\s*\$+\s*([\d\.]+(?:,\d+)?)/i);
     if (m1) {
       const n = _inputANumero(m1[1]);
       if (n >= 100000 && !(n >= 690000 && n <= 692000)) totalPagar = n;
     }
 
-    // 2) Respaldo: "Total a pagar $X" (por si el layout viniera sin "Total$X")
     if (!totalPagar) {
       const m2 = zonaPag1.match(/\bTotal\s*a\s*pagar\s*[:\-]?\s*\$+\s*([\d\.]+(?:,\d+)?)/i);
       if (m2) {
@@ -635,9 +877,39 @@ function _parsearEMOACDTE(textoOriginal) {
       }
     }
 
-    // 3) Último recurso: número en palabras ("Son … Pesos chilenos")
     if (!totalPagar) {
       totalPagar = _numeroEnPalabrasAPeso(tN);
+    }
+  }
+
+  // ─── Fallback 691041 por ETIQUETA ───
+  //  Si el loop por código no capturó nada para 691041 (código
+  //  garabateado por OCR), se busca la etiqueta literal.
+  {
+    const yaHay691041 = /691041/.test(t);
+    if (!yaHay691041) {
+      const _rxEtiqueta = /(?:ARRIENDO\s+(?:DE\s+)?MEDIDOR|OTROS\s+DX)/i;
+      const _mEt = tN.match(_rxEtiqueta);
+      if (_mEt) {
+        const _idxEt = _mEt.index;
+        const _zonaEt = tN.slice(_idxEt, _idxEt + 400);
+        const _corteEt = _zonaEt.search(
+          /\b(Afecto|Exento|IVA|Total[\s:$]|Son\s|Timbre|Verifique|Nota\s+De\s+D|Corrige\s+Montos)\b/i
+        );
+        const _zonaUtil = _corteEt > 20 ? _zonaEt.slice(0, _corteEt) : _zonaEt;
+
+        const _candsEt = (_zonaUtil.match(/\d{1,3}(?:\.\d{3})+(?:,\d+)?|\d{3,}(?:,\d+)?/g) || [])
+          .map(n => _inputANumero(n))
+          .filter(v => v >= 1000 && v !== 691041);
+        if (_candsEt.length) {
+          const _montoEt = _candsEt[_candsEt.length - 1];
+          peaje += _montoEt;
+          if (/ARRIENDO\s*(DE\s*)?MEDIDOR/i.test(_mEt[0])) tieneArriendo = true;
+          else tienePeaje = true;
+          _logDiag('[EMOAC] 691041 por ETIQUETA "' + _mEt[0] + '": ' + _montoEt +
+            ' · sumado a peaje · zona=' + JSON.stringify(_zonaUtil.slice(0, 200)));
+        }
+      }
     }
   }
 
@@ -646,16 +918,8 @@ function _parsearEMOACDTE(textoOriginal) {
   out.fKwh = kwh;
   out.fInt = Math.round(intSum);
   out.fIntPeaje = Math.round(intPeaje);
-  out.fOtros = 0;
-  out.fOtrosPeaje = Math.round(otrosPeaje + arriendo);
   out.fTotal = Math.round(totalPagar) || 0;
-  // Prioridad pedida por el usuario:
-  //   sum + peaje      → UNIFICADA
-  //   sum + arriendo   → CONSUMO
-  //   peaje + arriendo → PEAJE
-  //   solo arriendo    → ARRIENDO_MEDIDOR
-  //   solo peaje       → PEAJE
-  //   resto            → CONSUMO
+
   out.fTipo = (tieneSum && tienePeaje)      ? 'UNIFICADA'
             : (tieneSum && tieneArriendo)   ? 'SUMINISTRO'
             : (tienePeaje && tieneArriendo) ? 'PEAJE'
@@ -665,18 +929,13 @@ function _parsearEMOACDTE(textoOriginal) {
 
   if (!out.fPeriodo && out.fEmision) out.fPeriodo = out.fEmision.slice(0, 7);
 
-  // ⚠ Vencimiento: NUNCA se calcula. Si no aparece en el PDF, queda vacío.
-
   return out;
 }
 
 function _parsearAciertaDTE(textoOriginal) {
-  const _log = (m) => { try { Logger.log('[Acierta] ' + m); } catch(e) {} };
+  const _log = (m) => { try { Logger.log('[Acierta] ' + m); } catch (e) { } };
   const t0 = String(textoOriginal || '');
   const out = { fDTE: true, fEmpresa: 'Acierta' };
-
-  _log('t0.length=' + t0.length);
-  _log('t0(0..500)=' + JSON.stringify(t0.slice(0, 500)));
 
   const tN = t0
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
@@ -699,8 +958,7 @@ function _parsearAciertaDTE(textoOriginal) {
     if (/^(19|20)\d{2}$/.test(num)) num = '';
     if (/^5[6-9]\d{7,}$/.test(num)) num = '';
     if (num) out.fNumero = num;
-    _log('fNumero=' + out.fNumero);
-  } catch (e) { _log('ERR 1: ' + e.message); }
+  } catch (e) { }
 
   // ─── 2) RUT / CÓDIGO CLIENTE ───
   try {
@@ -719,8 +977,7 @@ function _parsearAciertaDTE(textoOriginal) {
       }
     }
     if (rut) { out.fCodigo = rut; out.fRut = rut; }
-    _log('fCodigo=' + out.fCodigo);
-  } catch (e) { _log('ERR 2: ' + e.message); }
+  } catch (e) { }
 
   // ─── 3) EMISIÓN / VENCIMIENTO ───
   try {
@@ -733,16 +990,14 @@ function _parsearAciertaDTE(textoOriginal) {
     if (mV) out.fVencimiento = mV[3] + '-' +
       String(parseInt(mV[2], 10)).padStart(2, '0') + '-' +
       String(parseInt(mV[1], 10)).padStart(2, '0');
-    _log('fEmision=' + out.fEmision + ' fVencimiento=' + out.fVencimiento);
-  } catch (e) { _log('ERR 3: ' + e.message); }
+  } catch (e) { }
 
   // ─── 4) PERÍODO ───
   try {
     const m = tN.match(/periodo\s*:?\s*(\d{2})\s*[-\/]\s*(\d{4})/i);
     if (m) out.fPeriodo = m[2] + '-' + m[1];
     if (!out.fPeriodo && out.fEmision) out.fPeriodo = out.fEmision.slice(0, 7);
-    _log('fPeriodo=' + out.fPeriodo);
-  } catch (e) { _log('ERR 4: ' + e.message); }
+  } catch (e) { }
 
   // ─── 5) MONTOS DEL PIE ───
   let exento = 0, neto = 0, iva = 0, total = 0;
@@ -758,8 +1013,7 @@ function _parsearAciertaDTE(textoOriginal) {
     total  = _monto('\\bTotal\\s*:');
     if (!neto)  neto  = _monto('\\bNeto');
     if (!total) total = _monto('\\bTotal');
-    _log('exento=' + exento + ' neto=' + neto + ' iva=' + iva + ' total=' + total);
-  } catch (e) { _log('ERR 5: ' + e.message); }
+  } catch (e) { }
 
   // ─── 6) PEAJE ───
   let peaje = 0;
@@ -771,8 +1025,7 @@ function _parsearAciertaDTE(textoOriginal) {
       const validos = nums.map(n => _inputANumero(n)).filter(n => n >= 1000);
       if (validos.length) peaje = validos[validos.length - 1];
     }
-    _log('peaje=' + peaje);
-  } catch (e) { _log('ERR 6: ' + e.message); }
+  } catch (e) { }
 
   // ─── 7) kWh ───
   let kwh = 0;
@@ -783,8 +1036,7 @@ function _parsearAciertaDTE(textoOriginal) {
       const m2 = tN.match(/ENERG[IÍ]A\s*(\d{3,}(?:,\d{1,3})?)/i);
       if (m2) kwh = _inputANumero(m2[1]);
     }
-    _log('kwh=' + kwh);
-  } catch (e) { _log('ERR 7: ' + e.message); }
+  } catch (e) { }
 
   // ─── 8) SUMINISTRO NETO ───
   let sum = 0;
@@ -792,7 +1044,7 @@ function _parsearAciertaDTE(textoOriginal) {
     if (neto > 0) sum = neto + exento - peaje;
     else if (total > 0) sum = total - iva - peaje;
     if (sum < 0) sum = 0;
-  } catch (e) { _log('ERR 8: ' + e.message); }
+  } catch (e) { }
 
   out.fSum        = Math.round(sum);
   out.fPeaje      = Math.round(peaje);
@@ -800,13 +1052,10 @@ function _parsearAciertaDTE(textoOriginal) {
   out.fTotal      = Math.round(total || (neto + iva + exento));
   out.fInt        = 0;
   out.fIntPeaje   = 0;
-  out.fOtros      = 0;
-  out.fOtrosPeaje = 0;
   out.fTipo       = (out.fPeaje > 0 && out.fSum > 0) ? 'UNIFICADA'
                   : (out.fPeaje > 0) ? 'PEAJE'
-                  : 'CONSUMO';
+                  : 'SUMINISTRO';
 
-  _log('RESULTADO: ' + JSON.stringify(out));
   return out;
 }
 
@@ -815,11 +1064,16 @@ function _parsearFacturaCompleta(textoOriginal) {
   const proveedor = _detectarProveedor(t0);
   Logger.log('[Router] Proveedor detectado: ' + proveedor);
   try {
+    const _charsNoWS = t0.replace(/\s/g, '').length;
+    Logger.log('[Router] Texto recibido: ' + t0.length + ' chars (' +
+      _charsNoWS + ' no-ws). Preview:\n' + t0.slice(0, 4000));
+  } catch (e) { }
+  try {
     const r = (proveedor === 'ACIERTA') ? _parsearAciertaDTE(t0) : _parsearEMOACDTE(t0);
     return r || {};
   } catch (e) {
     Logger.log('[Router] ✗ ERROR en ' + proveedor + ': ' + e.message +
-               ' | stack: ' + (e.stack || '(sin stack)'));
+      ' | stack: ' + (e.stack || '(sin stack)'));
     return { fDTE: true, fEmpresa: proveedor, _error: String(e.message || e) };
   }
 }
@@ -829,26 +1083,20 @@ function _parsearFacturaCompleta(textoOriginal) {
  * ═══════════════════════════════════════════════════════════════ */
 
 // ============================================================
-//  DIAGNÓSTICO — reporte consolidado por PDF
+//  DIAGNÓSTICO
 // ============================================================
-let _DIAG_BUFFER = [];
 let _DIAG_INTENTOS = [];
+let _DIAG_ARCHIVO = '';
 
 function _logDiag(msg) {
   try { Logger.log(msg); } catch (e) { }
-  _DIAG_BUFFER.push(String(msg));
 }
 
 function _diagReset(nombreArchivo) {
-  _DIAG_BUFFER = [];
   _DIAG_INTENTOS = [];
   _DIAG_ARCHIVO = String(nombreArchivo || 'factura.pdf');
 }
-let _DIAG_ARCHIVO = '';
 
-/**
- * Registra un intento de extracción en el buffer de diagnóstico.
- */
 function _diagIntentar(fuente, ok, datos) {
   datos = datos || {};
   const campos = datos.campos || null;
@@ -862,7 +1110,6 @@ function _diagIntentar(fuente, ok, datos) {
   };
   _DIAG_INTENTOS.push(entry);
 
-  // Log inmediato resumido por fuente
   if (ok && campos) {
     const det = _contarCamposDetectadosBack(campos);
     Logger.log('[DIAG] ' + fuente + ' → OK · chars=' + entry.chars +
@@ -873,9 +1120,6 @@ function _diagIntentar(fuente, ok, datos) {
   }
 }
 
-/**
- * Emite el reporte final con todas las fuentes intentadas.
- */
 function _diagReporteFinal(camposFinales, fuenteFinal, ok) {
   const lineas = [];
   const sep = '═══════════════════════════════════════════════════════════════';
@@ -891,7 +1135,7 @@ function _diagReporteFinal(camposFinales, fuenteFinal, ok) {
     if (it.chars) lineas.push('    Chars extraídos: ' + it.chars);
     if (it.campos) {
       const claves = ['fNumero', 'fCodigo', 'fRut', 'fPeriodo', 'fEmision', 'fVencimiento',
-        'fKwh', 'fSum', 'fPeaje', 'fInt', 'fIntPeaje', 'fOtros', 'fOtrosPeaje', 'fTotal', 'fTipo'];
+        'fKwh', 'fSum', 'fPeaje', 'fInt', 'fIntPeaje', 'fTotal', 'fTipo'];
       const presentes = claves.filter(k => {
         const v = it.campos[k];
         return v !== undefined && v !== null && v !== '' && v !== 0;
@@ -910,7 +1154,7 @@ function _diagReporteFinal(camposFinales, fuenteFinal, ok) {
   lineas.push('    Válido (fNumero && fCodigo): ' + (ok ? 'SÍ' : 'NO'));
   if (camposFinales) {
     const claves = ['fNumero', 'fCodigo', 'fRut', 'fPeriodo', 'fEmision', 'fVencimiento',
-      'fKwh', 'fSum', 'fPeaje', 'fInt', 'fIntPeaje', 'fOtros', 'fOtrosPeaje', 'fTotal', 'fTipo'];
+      'fKwh', 'fSum', 'fPeaje', 'fInt', 'fIntPeaje', 'fTotal', 'fTipo'];
     claves.forEach(k => {
       const v = camposFinales[k];
       const tiene = v !== undefined && v !== null && v !== '' && v !== 0;
@@ -923,12 +1167,9 @@ function _diagReporteFinal(camposFinales, fuenteFinal, ok) {
   Logger.log(lineas.join('\n'));
 }
 
-/**
- * Cuenta campos presentes/faltantes en un objeto de campos.
- */
 function _contarCamposDetectadosBack(campos) {
   const claves = ['fNumero', 'fCodigo', 'fRut', 'fPeriodo', 'fEmision', 'fVencimiento',
-    'fKwh', 'fSum', 'fPeaje', 'fInt', 'fIntPeaje', 'fOtros', 'fOtrosPeaje', 'fTotal'];
+    'fKwh', 'fSum', 'fPeaje', 'fInt', 'fIntPeaje', 'fTotal'];
   let total = 0;
   const faltantes = [];
   claves.forEach(k => {
@@ -940,10 +1181,6 @@ function _contarCamposDetectadosBack(campos) {
   return { total, totalClaves: claves.length, faltantes };
 }
 
-/**
- * Determina si un conjunto de campos es "utilizable" — es decir,
- * tiene los dos identificadores mínimos: N° Factura y Código.
- */
 function _camposSonUtilizables(campos) {
   if (!campos) return false;
   return !!(campos.fNumero && campos.fCodigo);
@@ -971,11 +1208,6 @@ const CENTROS_SEED = [
 ];
 
 let _configCache = null;
-
-// Cache con TTL corto: si pasan más de 30s desde la última lectura,
-// se relee la hoja Config. Esto evita que una edición hecha por el
-// usuario (nombre de centro, empresa, etc.) quede "invisible" para
-// el backend durante toda la sesión de Apps Script.
 const CONFIG_TTL_MS = 30 * 1000;
 let _configCacheTs = 0;
 
@@ -1011,44 +1243,17 @@ function leerConfig() {
         empresa: String(r[8] || '').trim() || 'EMOAC'
       }));
   }
-  _configCache = { periodos, centros };
+  _configCache = { periodos: periodos || [], centros: centros || [] };
   _configCacheTs = ahora;
   return _configCache;
 }
 
-/**
- * Fuerza la recarga de Config en la próxima llamada a leerConfig().
- * Se llama desde los handlers que modifican la hoja Config.
- */
 function _invalidarConfigCache() {
   _configCache = null;
   _configCacheTs = 0;
 }
 
-function _initConfig(sh) {
-  sh.clear();
-  const hdr = ['Periodo', 'RUT', 'Código', 'Cliente', 'Empalme Suministro', 'Empalme Peaje', 'DriveOp', 'DriveCom', 'Rut (legacy)', 'Empresa'];
-  sh.getRange(1, 1, 1, hdr.length).setValues([hdr]);
-  sh.getRange(1, 1, 1, hdr.length).setFontWeight('bold').setBackground('#1e293b').setFontColor('#ffffff');
-  if (PERIODOS_SEED.length) {
-    sh.getRange(2, 1, PERIODOS_SEED.length, 1).setValues(PERIODOS_SEED.map(p => [p]));
-    sh.getRange(2, 1, PERIODOS_SEED.length, 1).setNumberFormat('@');
-  }
-  if (CENTROS_SEED.length) {
-    sh.getRange(2, 2, CENTROS_SEED.length, 9).setValues(
-      CENTROS_SEED.map(c => [
-        c.rut || '', c.codigo || '', c.cliente || '',
-        c.empConsumo || '', c.empPeaje || '',
-        c.driveOp || '', c.driveCom || '', '',
-        c.empresa || 'EMOAC'
-      ])
-    );
-  }
-  sh.setColumnWidth(1, 100); sh.setColumnWidth(3, 120); sh.setColumnWidth(4, 220);
-  sh.setColumnWidth(5, 140); sh.setColumnWidth(6, 140); sh.setColumnWidth(7, 280);
-  sh.setColumnWidth(8, 280); sh.setColumnWidth(9, 140); sh.setColumnWidth(10, 120);
-  sh.setFrozenRows(1);
-}
+// _initConfig se movió a utilidades.gs (sólo se invoca desde el menú).
 
 function agregarPeriodoConfig(periodo) {
   periodo = String(periodo || '').trim();
@@ -1212,17 +1417,6 @@ function subirFacturaDrive(codigoCliente, nombreArchivo, base64, mimeType) {
   return { ok: true, archivos, errores, centro: centro.cliente };
 }
 
-/**
- * Vincula un PDF (ID de Drive) a la factura indicada.
- *
- * Si el ID ya está asociado a OTRA factura distinta y no se pasa
- * `forzar = true`, no toca nada y devuelve:
- *   { ok: false, conflicto: true, facturasEnConflicto: [...] }
- * para que el frontend ofrezca reasignarlo.
- *
- * Con `forzar = true` desvincula el ID de las facturas anteriores y lo
- * asigna a la nueva.
- */
 function vincularPDFDrive(numero, urlOrId, nombreArchivo, forzar) {
   const id = parseDriveId(urlOrId);
   if (!id) return { ok: false, error: 'Falta el ID o URL del archivo' };
@@ -1235,8 +1429,8 @@ function vincularPDFDrive(numero, urlOrId, nombreArchivo, forzar) {
   const data = sh.getDataRange().getValues();
   const numBuscado = String(numero).trim();
 
-  const filasDestino   = [];   // filas de la factura nueva
-  const filasConflicto = [];   // filas de otras facturas que ya tienen este ID
+  const filasDestino   = [];
+  const filasConflicto = [];
 
   for (let i = 1; i < data.length; i++) {
     const numFila = String(data[i][COL.NUMERO - 1] || '').trim();
@@ -1257,7 +1451,6 @@ function vincularPDFDrive(numero, urlOrId, nombreArchivo, forzar) {
     return { ok: false, error: 'Factura no encontrada: ' + numBuscado };
   }
 
-  // Conflicto sin permiso explícito → sólo informar, no modificar nada.
   if (filasConflicto.length && !forzar) {
     return {
       ok: false,
@@ -1272,19 +1465,16 @@ function vincularPDFDrive(numero, urlOrId, nombreArchivo, forzar) {
     };
   }
 
-  // Renombrar sólo cuando ya decidimos aplicar el cambio.
   if (nombreArchivo) {
-    try { file.setName(String(nombreArchivo).trim()); } catch (e) {}
+    try { file.setName(String(nombreArchivo).trim()); } catch (e) { }
   }
 
-  // Desvincular de las facturas anteriores.
   filasConflicto.forEach(x => {
     const c = sh.getRange(x.fila, COL.PDF_ID);
     c.setValue('');
     c.setNumberFormat('@');
   });
 
-  // Asignar a la factura nueva.
   filasDestino.forEach(fr => {
     const c = sh.getRange(fr, COL.PDF_ID);
     c.setValue(id);
@@ -1306,26 +1496,18 @@ function vincularPDFDrive(numero, urlOrId, nombreArchivo, forzar) {
   };
 }
 
-/**
- * Reemplaza el PDF_ID de una factura por otro (para cuando el
- * original fue a la papelera y el usuario consigue el nuevo ID).
- * No renombra ni copia el archivo nuevo: sólo actualiza la BD.
- * Si el archivo nuevo tiene el nombre estándar, se respeta tal cual.
- */
 function reemplazarPDFFactura(numero, nuevoId) {
   const num = String(numero || '').trim();
   const id  = parseDriveId(nuevoId);
   if (!num) return { ok: false, error: 'Falta N° factura' };
   if (!id)  return { ok: false, error: 'Falta ID de Drive' };
 
-  // Confirmar acceso al archivo nuevo.
   let file;
   try { file = DriveApp.getFileById(id); }
   catch (e) { return { ok: false, error: 'No se puede acceder al archivo: ' + e.message }; }
 
-  // Detectar si el archivo nuevo está en papelera.
   let enPapelera = false;
-  try { enPapelera = file.isTrashed(); } catch (e) {}
+  try { enPapelera = file.isTrashed(); } catch (e) { }
   if (enPapelera) return { ok: false, error: 'El archivo indicado está en la papelera.' };
 
   const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
@@ -1349,19 +1531,13 @@ function reemplazarPDFFactura(numero, nuevoId) {
   };
 }
 
-/**
- * Verifica el estado del archivo apuntado por un PDF_ID:
- *   · ok         → existe y no está en papelera
- *   · papelera   → existe pero está trashed
- *   · inexistente→ no se puede acceder (borrado definitivo o sin permisos)
- */
 function verificarEstadoPDF(id) {
   const limpio = parseDriveId(id);
   if (!limpio) return { ok: false, estado: 'inexistente', error: 'ID vacío' };
   try {
     const file = DriveApp.getFileById(limpio);
     let trashed = false;
-    try { trashed = file.isTrashed(); } catch (e) {}
+    try { trashed = file.isTrashed(); } catch (e) { }
     if (trashed) {
       return { ok: true, estado: 'papelera', id: limpio, nombre: file.getName() };
     }
@@ -1374,21 +1550,6 @@ function verificarEstadoPDF(id) {
   }
 }
 
-/**
- * Busca en el Drive de Operaciones (y, si aplica, en el de la Comunidad)
- * del centro un archivo cuyo nombre contenga el N° de factura.
- * Devuelve el PRIMER match encontrado con su metadata.
- *
- * @param {string} codigo    Código del centro (clave en Config)
- * @param {string} numero    N° de factura a buscar en el nombre
- * @returns {{
- *   ok: boolean,
- *   encontrado: boolean,
- *   id?: string, nombre?: string, url?: string,
- *   carpeta?: 'Operaciones'|'Comunidad',
- *   error?: string
- * }}
- */
 function _buscarPDFEnDriveDelCentro(codigo, numero) {
   const cod = String(codigo || '').trim();
   const num = String(numero || '').trim();
@@ -1408,16 +1569,13 @@ function _buscarPDFEnDriveDelCentro(codigo, numero) {
     return { ok: false, encontrado: false, error: 'El centro no tiene Drive configurado' };
   }
 
-  // El N° puede venir con o sin ceros a la izquierda. Se busca por
-  // coincidencia parcial del número (con word boundary) para tolerar
-  // nombres como "..._56390_..." o "..._00056390_...".
   const numLimpio = num.replace(/^0+/, '') || num;
   const reNum = new RegExp('(?:^|[^0-9])0*' + numLimpio + '(?:[^0-9]|$)');
 
   for (const carpeta of carpetas) {
     let folder;
     try { folder = DriveApp.getFolderById(carpeta.id); }
-    catch (e) { continue; }   // carpeta inaccesible → siguiente
+    catch (e) { continue; }
 
     const files = folder.getFiles();
     while (files.hasNext()) {
@@ -1425,13 +1583,11 @@ function _buscarPDFEnDriveDelCentro(codigo, numero) {
       let nombre = '';
       try { nombre = f.getName(); } catch (e) { continue; }
 
-      // Sólo PDFs y que contengan el N° de factura.
       if (!/\.pdf$/i.test(nombre)) continue;
       if (!reNum.test(nombre)) continue;
 
-      // Verificar que no esté en papelera (por las dudas).
       let trashed = false;
-      try { trashed = f.isTrashed(); } catch (e) {}
+      try { trashed = f.isTrashed(); } catch (e) { }
       if (trashed) continue;
 
       return {
@@ -1452,18 +1608,7 @@ function _buscarPDFEnDriveDelCentro(codigo, numero) {
   };
 }
 
-/**
- * Copia (o renombra in-place) un PDF ya existente en Drive a los
- * repositorios de Operaciones y Comunidad del centro indicado.
- * Si el archivo ya está en alguno de ellos, sólo lo renombra.
- * Si no está, lo copia.
- *
- * @param {string} idOrigen       ID o URL del archivo PDF
- * @param {string} codigoCliente  Código del centro (clave en Config)
- * @param {string} nombreArchivo  Nombre final del archivo (con .pdf)
- * @returns {{ ok:boolean, archivos?:Array, errores?:Array, centro?:string, error?:string }}
- */
-function copiarPDFDriveADestinos(idOrigen, codigoCliente, nombreArchivo) {
+function copiarPDFDriveADestinos(idOrigen, codigoCliente, nombreArchivo, moverDesdeId) {
   const codigo = String(codigoCliente || '').trim();
   if (!codigo) return { ok: false, error: 'Falta el código de cliente' };
   const id = parseDriveId(idOrigen);
@@ -1486,6 +1631,47 @@ function copiarPDFDriveADestinos(idOrigen, codigoCliente, nombreArchivo) {
   const opIgualCom = centro.driveOp && centro.driveCom && centro.driveOp === centro.driveCom;
   const archivos = [];
   const errores = [];
+
+  const moverDesde = String(moverDesdeId || '').trim();
+  if (moverDesde && foldersOrigen[moverDesde] && centro.driveOp) {
+    try {
+      fileOrigen.setName(nombre);
+      fileOrigen.moveTo(DriveApp.getFolderById(centro.driveOp));
+      archivos.push({
+        carpeta: 'Drive de Operaciones',
+        id: fileOrigen.getId(),
+        url: fileOrigen.getUrl(),
+        nombre: fileOrigen.getName(),
+        accion: 'movido'
+      });
+    } catch (e) { errores.push({ carpeta: 'Mover a Operaciones', error: e.message }); }
+    if (centro.driveCom && centro.driveCom !== centro.driveOp) {
+      try {
+        const blob = fileOrigen.getBlob();
+        const bytes = blob.getBytes();
+        const mime = blob.getContentType() || 'application/pdf';
+        const nueva = DriveApp.getFolderById(centro.driveCom).createFile(
+          Utilities.newBlob(bytes, mime, nombre)
+        );
+        archivos.push({
+          carpeta: 'Drive de la Comunidad',
+          id: nueva.getId(),
+          url: nueva.getUrl(),
+          nombre: nueva.getName(),
+          accion: 'copiado'
+        });
+      } catch (e) { errores.push({ carpeta: 'Drive de la Comunidad', error: e.message }); }
+    }
+    if (!archivos.length) {
+      return {
+        ok: false,
+        error: 'No se pudo mover el PDF. ' +
+          errores.map(e => e.carpeta + ': ' + e.error).join(' · ')
+      };
+    }
+    return { ok: true, archivos, errores, centro: centro.cliente };
+  }
+
   if (enOp || enCom || opIgualCom) {
     try {
       fileOrigen.setName(nombre);
@@ -1588,7 +1774,7 @@ function extraerTextoDesdeDrive(id) {
 }
 
 // ============================================================
-//  OCR tradicional (Drive OCR + OCR.space)
+//  OCR
 // ============================================================
 function extraerTextoPDF(nombreArchivo, base64, mimeType) {
   const r1 = _extraerConDriveOCR(nombreArchivo, base64, mimeType);
@@ -1610,7 +1796,6 @@ function extraerTextoPDF(nombreArchivo, base64, mimeType) {
 }
 
 function _extraerConDriveOCR(nombreArchivo, base64, mimeType) {
-  // Cuota ya agotada → fallar rápido sin llamar a la API
   if (_driveOcrEstaBloqueado()) {
     return { ok: false, error: 'Drive OCR bloqueado por cuota (skip rápido)' };
   }
@@ -1633,7 +1818,6 @@ function _extraerConDriveOCR(nombreArchivo, base64, mimeType) {
     return { ok: true, texto: txtCompleto, motor: 'Drive OCR' };
   } catch (e) {
     const msg = String(e.message || e);
-    // Cuota agotada → bloquear para el resto del lote
     if (/rate limit exceeded for OCR/i.test(msg)
       || /User rate limit exceeded/i.test(msg)) {
       _bloquearDriveOcrPorCuota(msg);
@@ -1690,7 +1874,7 @@ function _extraerConOCRSpace(nombreArchivo, base64, mimeType) {
 }
 
 // ============================================================
-//  GEMINI — último recurso
+//  GEMINI
 // ============================================================
 const GEMINI_PROMPT = [
   'Eres un extractor de datos de facturas eléctricas chilenas.',
@@ -1708,12 +1892,12 @@ const GEMINI_PROMPT = [
   '',
   'Definiciones:',
   '· fSum = suministro neto (afecto + exento), SIN peaje, SIN IVA.',
-  '· fPeaje = cargo por peaje (si aplica).',
+  '· fPeaje = cargo por peaje. Incluye el código 691041 ("OTROS DX"',
+  '  o "ARRIENDO MEDIDOR") cuando esté presente.',
   '· fTotal = total a pagar (con IVA e intereses).',
   '· fTipo: "SUMINISTRO" | "PEAJE" | "UNIFICADA" | "ARRIENDO_MEDIDOR".',
-  '· Usa "ARRIENDO_MEDIDOR" SOLO cuando la factura no traiga cargos',
-  '  de suministro ni de peaje, y su único cargo sea el arriendo de',
-  '  medidor (código 691041 en EMOAC: "OTROS DX ... Arriendo Medidor").',
+  '· Usa "ARRIENDO_MEDIDOR" SOLO cuando el único cargo de la factura',
+  '  sea el arriendo de medidor (código 691041 en EMOAC).',
   '· fVencimiento: sólo si aparece en el PDF. Nunca lo inventes.',
   '',
   'Devuelve SOLO un objeto JSON crudo, sin markdown, sin ```json.',
@@ -1721,8 +1905,7 @@ const GEMINI_PROMPT = [
   '  "fEmpresa": "EMOAC" | "Acierta",',
   '  "fNumero": "...", "fCodigo": "...", "fRut": "...",',
   '  "fPeriodo": "YYYY-MM", "fEmision": "YYYY-MM-DD", "fVencimiento": "YYYY-MM-DD",',
-  '  "fKwh": 0, "fSum": 0, "fPeaje": 0, "fInt": 0, "fIntPeaje": 0,',
-  '  "fOtros": 0, "fOtrosPeaje": 0, "fTotal": 0, "fTipo": "..."',
+  '  "fKwh": 0, "fSum": 0, "fPeaje": 0, "fInt": 0, "fIntPeaje": 0, "fTotal": 0, "fTipo": "..."',
   '}',
   '',
   'Si un campo no aparece, usa "" para strings y 0 para números.'
@@ -1809,8 +1992,6 @@ function _extraerConGemini(base64, mimeType, nombreArchivo) {
     fPeaje: Math.round(_inputANumero(campos.fPeaje)),
     fInt: Math.round(_inputANumero(campos.fInt)),
     fIntPeaje: Math.round(_inputANumero(campos.fIntPeaje)),
-    fOtros: Math.round(_inputANumero(campos.fOtros)),
-    fOtrosPeaje: Math.round(_inputANumero(campos.fOtrosPeaje)),
     fTotal: Math.round(_inputANumero(campos.fTotal)),
     fTipo: String(campos.fTipo || 'CONSUMO').toUpperCase()
   };
@@ -1830,10 +2011,6 @@ function _extraerConGemini(base64, mimeType, nombreArchivo) {
   return { ok: true, campos: out, motor: 'Gemini (' + GEMINI_MODEL + ')' };
 }
 
-/**
- * Endpoint de parsing completo con cascada y diagnóstico.
- * Prioridad: Drive OCR → OCR.space → Gemini (último).
- */
 function _parsearConCascadaBack(base64, mime, nombre) {
   _diagReset(nombre || 'factura.pdf');
 
@@ -1853,7 +2030,6 @@ function _parsearConCascadaBack(base64, mime, nombre) {
     return ok;
   };
 
-  // 1) Drive OCR — sólo si no está bloqueado por cuota
   if (_driveOcrEstaBloqueado()) {
     _diagIntentar('Drive OCR', false, { error: 'Cuota agotada (saltado)' });
   } else {
@@ -1869,7 +2045,6 @@ function _parsearConCascadaBack(base64, mime, nombre) {
     }
   }
 
-  // 2) OCR.space
   const r2 = _extraerConOCRSpace(nombre, base64, mime);
   if (r2.ok && r2.texto) {
     const campos = _parsearFacturaCompleta(r2.texto);
@@ -1881,7 +2056,6 @@ function _parsearConCascadaBack(base64, mime, nombre) {
     _diagIntentar('OCR.space', false, { error: r2.error });
   }
 
-  // 3) Gemini — ÚLTIMO RECURSO
   if (GEMINI_API_KEY && String(GEMINI_API_KEY).trim()) {
     const g = _extraerConGemini(base64, mime, nombre);
     if (g.ok && g.campos) {
@@ -1896,7 +2070,6 @@ function _parsearConCascadaBack(base64, mime, nombre) {
     _diagIntentar('Gemini', false, { error: 'No configurado' });
   }
 
-  // Ninguna fuente dio campos utilizables
   _diagReporteFinal(mejorCampos, mejorFuente || '(ninguna)', false);
   return { ok: !!mejorCampos, campos: mejorCampos, fuente: mejorFuente, parcial: true };
 }
@@ -1945,13 +2118,10 @@ function normalizarPeriodoLectura(valor) {
 function parseISO(iso) {
   const s = String(iso == null ? '' : iso).trim();
   if (!s) return '';
-  // ISO: yyyy-mm-dd
   let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
   if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
-  // Chileno: dd/mm/yyyy o dd-mm-yyyy
   m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
   if (m) return new Date(+m[3], +m[2] - 1, +m[1]);
-  // Sentinelas y valores raros: devolver string tal cual para no romper
   return s;
 }
 
@@ -2013,6 +2183,7 @@ function doPost(e) {
     if (b.accion === 'marcarFacturaRevisada')  return jsonResp(marcarFacturaRevisada(b.numero));
     if (b.accion === 'construirNombreArchivo') return jsonResp({ ok: true, nombre: _construirNombreArchivoEstandar(b.datos || {}) });
     if (b.accion === 'vincularPDF')            return jsonResp(vincularPDFDrive(b.numero, b.urlOrId, b.nombreArchivo, !!b.forzar));
+    if (b.accion === 'reemplazarYDistribuirPDF') return jsonResp(reemplazarYDistribuirPDF(b.numero, b.idOrigen, b.codigoCentro, b.nombreArchivo));
     if (b.accion === 'reemplazarPDFFactura')   return jsonResp(reemplazarPDFFactura(b.numero, b.urlOrId));
     if (b.accion === 'verificarEstadoPDF')     return jsonResp(verificarEstadoPDF(b.id));
     if (b.accion === 'buscarPDFEnDriveDelCentro') return jsonResp(_buscarPDFEnDriveDelCentro(b.codigo, b.numero));
@@ -2051,6 +2222,7 @@ function rectificarFacturaBridge(n, nc, ncod, np) { return rectificarFactura(n, 
 function marcarFacturaRevisadaBridge(numero) { return marcarFacturaRevisada(numero); }
 function construirNombreArchivoBridge(datos) { return _construirNombreArchivoEstandar(datos); }
 function vincularPDFBridge(n, u, nn, forzar) { return vincularPDFDrive(n, u, nn, !!forzar); }
+function reemplazarYDistribuirPDFBridge(n, id, cod, nn) { return reemplazarYDistribuirPDF(n, id, cod, nn); }
 function reemplazarPDFFacturaBridge(n, u)    { return reemplazarPDFFactura(n, u); }
 function verificarEstadoPDFBridge(id)        { return verificarEstadoPDF(id); }
 function buscarPDFEnDriveDelCentroBridge(codigo, numero) { return _buscarPDFEnDriveDelCentro(codigo, numero); }
@@ -2068,46 +2240,28 @@ function parsearFacturaGeminiBridge(base64, mimeType, nombreArchivo) {
 
 // ============================================================
 //  MANUAL DE USUARIO
-//  Devuelve el contenido de manual.html como string para que el
-//  frontend lo inyecte en un <iframe srcdoc="...">.
-//  Se cachea en memoria durante la ejecución para no releer el
-//  archivo si el usuario abre/cierra el modal varias veces.
 // ============================================================
 let _MANUAL_HTML_CACHE_BACK = null;
 
-function obtenerHTMLManual(){
-  if(_MANUAL_HTML_CACHE_BACK !== null) return _MANUAL_HTML_CACHE_BACK;
+function obtenerHTMLManual() {
+  if (_MANUAL_HTML_CACHE_BACK !== null) return _MANUAL_HTML_CACHE_BACK;
   try {
     let html = HtmlService
       .createHtmlOutputFromFile('manual')
       .getContent();
 
-    // ─── Incrustar el mapa de imágenes de la hoja "img" ───
-    //  El manual se inyecta dentro de un <iframe srcdoc>, donde
-    //  google.script.run NO existe. Por eso las imágenes se pasan
-    //  como JSON embebido en el propio HTML. Cero hardcodeo: la
-    //  fuente sigue siendo la hoja "img" del spreadsheet.
-    // ─── Sólo IDs: el HTML se sirve al instante ───
-    //  Las imágenes se hidratan en segundo plano desde el propio
-    //  manual (ver obtenerImagenesManualHidratadasAsync), así la
-    //  ventana se abre en milisegundos y las capturas van apareciendo.
     let mapa = {};
     try { mapa = obtenerImagenesManual(); } catch (e) { mapa = {}; }
     const json = JSON.stringify(mapa || {}).replace(/</g, '\\u003c');
 
-    // Reemplazar los marcadores de versión del HTML por el valor
-    // declarado en MANUAL_VERSION. Si el HTML no los tuviera, no pasa nada.
     const version = String(MANUAL_VERSION || '').trim();
     if (version) {
-      html = html
-        .replace(/__MANUAL_VERSION__/g, version);
+      html = html.replace(/__MANUAL_VERSION__/g, version);
     }
 
     const inyeccion =
       '<script>window.__IMG_MANUAL__ = ' + json + ';<\/script>';
 
-    // Insertar justo antes del </head> para que esté disponible
-    // cuando arranque el DOMContentLoaded del manual.
     if (/<\/head>/i.test(html)) {
       html = html.replace(/<\/head>/i, inyeccion + '</head>');
     } else {
@@ -2118,10 +2272,10 @@ function obtenerHTMLManual(){
     return _MANUAL_HTML_CACHE_BACK;
   } catch (e) {
     return '<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;color:#b91c1c">' +
-           '<h2>⚠ No se pudo cargar el manual</h2>' +
-           '<p>' + String(e.message || e) + '</p>' +
-           '<p>Verifica que exista el archivo <code>manual.html</code> en el proyecto.</p>' +
-           '</body></html>';
+      '<h2>⚠ No se pudo cargar el manual</h2>' +
+      '<p>' + String(e.message || e) + '</p>' +
+      '<p>Verifica que exista el archivo <code>manual.html</code> en el proyecto.</p>' +
+      '</body></html>';
   }
 }
 
@@ -2129,7 +2283,7 @@ function obtenerImagenesManual() {
   const hoja = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('img');
   if (!hoja) return {};
   const lr = hoja.getLastRow();
-  if (lr < 2) return {};              // sólo encabezado o vacía
+  if (lr < 2) return {};
   const datos = hoja.getRange(2, 1, lr - 1, 2).getValues();
   const mapa = {};
   datos.forEach(([clave, id]) => {
@@ -2140,39 +2294,16 @@ function obtenerImagenesManual() {
   return mapa;
 }
 
-/**
- * Versión "hidratada" del mapa de imágenes del manual: en vez de
- * devolver { clave: idDrive }, devuelve { clave: dataURI }. El
- * backend lee el blob de cada archivo una sola vez y lo entrega
- * embebido, así el navegador no tiene que ir a buscar nada a Drive.
- *
- * Se cachea en memoria durante la ejecución (ScriptProperties tiene
- * un tope de 9KB por valor — no sirve para guardar binarios grandes).
- * El cache dura lo que dura la ejecución del script, que es
- * suficiente: cuando el usuario abre el manual, se paga el costo
- * una sola vez y los siguientes abrir/cerrar son instantáneos.
- */
 let _IMG_HIDRATADAS_CACHE = null;
 
-/**
- * Endpoint expuesto a google.script.run para que el manual, YA ABIERTO,
- * pida las imágenes hidratadas en background. Devuelve
- * { clave: dataURI } y reemplaza los placeholders cuando llega.
- *
- * Va aparte de obtenerImagenesManualHidratadas() para no romper la
- * ruta sincrónica (que sigue disponible por si otro flujo la usa).
- */
 function obtenerImagenesManualHidratadasAsync() {
   return obtenerImagenesManualHidratadas();
 }
 
 function obtenerImagenesManualHidratadas() {
-  // Nota: el cache dura lo que dura la ejecución del script. Si necesitas
-  // que un cambio en la hoja "img" se refleje de inmediato, comenta esta
-  // línea o bórrala antes de servir el manual.
   if (_IMG_HIDRATADAS_CACHE) return _IMG_HIDRATADAS_CACHE;
 
-  const mapa = obtenerImagenesManual();      // { clave: idDrive }
+  const mapa = obtenerImagenesManual();
   const salida = {};
 
   Object.keys(mapa).forEach(clave => {
@@ -2184,7 +2315,6 @@ function obtenerImagenesManualHidratadas() {
       const b64  = Utilities.base64Encode(blob.getBytes());
       salida[clave] = 'data:' + mime + ';base64,' + b64;
     } catch (e) {
-      // Si una imagen falla, se omite: el frontend deja el placeholder.
       Logger.log('Imagen "' + clave + '" (' + id + ') no se pudo leer: ' + e.message);
     }
   });
@@ -2192,6 +2322,7 @@ function obtenerImagenesManualHidratadas() {
   _IMG_HIDRATADAS_CACHE = salida;
   return salida;
 }
+
 // ============================================================
 //  LECTURA
 // ============================================================
@@ -2214,15 +2345,13 @@ function leerResumen() {
         sum: Number(r[COL.SUM - 1]) || 0,
         peaje: Number(r[COL.PEAJE - 1]) || 0,
         intereses: Number(r[COL.INT - 1]) || 0,
-        otros: Number(r[COL.OTROS - 1]) || 0,
         total: Number(r[COL.TOTAL - 1]) || 0,
         fechaConsumo: formatearFechaSegura(r[COL.FECHA_SUMINISTRO - 1], tz),
         fechaPeaje: formatearFechaSegura(r[COL.FECHA_PEAJE - 1], tz),
         fechaEmision: formatearFechaSegura(r[COL.FECHA_EMISION - 1], tz),
         fechaVencimiento: formatearFechaSegura(r[COL.FECHA_VENC - 1], tz),
         pdfId: String(r[COL.PDF_ID - 1] || '').trim(),
-        intPeaje: Number(r[COL.INT_PEAJE - 1]) || 0,
-        otrosPeaje: Number(r[COL.OTROS_PEAJE - 1]) || 0
+        intPeaje: Number(r[COL.INT_PEAJE - 1]) || 0
       };
     });
 }
@@ -2238,11 +2367,6 @@ function actualizarFecha(numero, fecha, tipo) {
       const tipoFactura = String(data[i][COL.TIPO - 1] || '').toUpperCase();
       let cols = [];
       if (tipoFactura === 'UNIFICADA') {
-        // Una factura UNIFICADA es un único documento físico, recibido
-        // en una fecha única. Al registrar la recepción desde cualquier
-        // celda (Suministro o Peaje) en el Seguimiento, la fecha debe
-        // quedar en AMBAS columnas para reflejar que la factura completa
-        // fue recibida.
         cols = [COL.FECHA_SUMINISTRO, COL.FECHA_PEAJE];
       } else if (tipoFactura === 'SUMINISTRO' || tipoFactura === 'CONSUMO') cols = [COL.FECHA_SUMINISTRO];
       else if (tipoFactura === 'PEAJE' || tipoFactura === 'ARRIENDO_MEDIDOR') cols = [COL.FECHA_PEAJE];
@@ -2257,7 +2381,6 @@ function actualizarFecha(numero, fecha, tipo) {
           c.setValue(fecha);
         } else if (fecha) {
           const p = fecha.split('-').map(Number);
-          // Formato ANTES del valor: garantiza que Sheets lo almacene como Date
           c.setNumberFormat('dd/mm/yyyy');
           c.setValue(new Date(p[0], p[1] - 1, p[2]));
         } else {
@@ -2280,8 +2403,8 @@ function actualizarCampo(numeroOrig, tipoOrig, periodo, campo, valor) {
     'fechaConsumo': COL.FECHA_SUMINISTRO, 'fechaPeaje': COL.FECHA_PEAJE,
     'fechaEmision': COL.FECHA_EMISION, 'fechaVencimiento': COL.FECHA_VENC,
     'kwh': COL.KWH, 'sum': COL.SUM, 'peaje': COL.PEAJE,
-    'intereses': COL.INT, 'otros': COL.OTROS, 'total': COL.TOTAL,
-    'intPeaje': COL.INT_PEAJE, 'otrosPeaje': COL.OTROS_PEAJE
+    'intereses': COL.INT, 'total': COL.TOTAL,
+    'intPeaje': COL.INT_PEAJE
   };
   const col = mapa[campo];
   if (!col) return { ok: false, error: 'Campo no permitido: ' + campo };
@@ -2329,21 +2452,12 @@ function agregarFacturaFront(datos) {
   const ss = SpreadsheetApp.openById(SS_ID);
   const sh = ss.getSheetByName(HOJA_RESUMEN);
   const existentes = leerResumen();
-  // Normalizar alias legacy "CONSUMO" → "SUMINISTRO" para que coincida
-  // con la nomenclatura actual y con los chequeos de recepción de abajo.
   let tipoNuevo = (datos.tipo || 'SUMINISTRO').toUpperCase();
   if (tipoNuevo === 'CONSUMO') tipoNuevo = 'SUMINISTRO';
   const dup = existentes.find(function (f) { return f.numero === String(datos.numero).trim(); });
   if (dup) throw new Error('Ya existe la factura N°' + datos.numero);
   let codigo = datos.codigo || '';
   if (!codigo) { const c = existentes.find(f => f.cliente === datos.cliente && f.codigo); if (c) codigo = c.codigo; }
-  // Prioridad para las fechas de recepción al CREAR una factura:
-  //   1. Si datos.fechaConsumo / datos.fechaPeaje vienen explícitos
-  //      (p.ej. desde CSV de importación), se respetan tal cual.
-  //   2. Si no, se deriva de datos.fecha (formulario del modal).
-  //   3. Si tampoco hay datos.fecha, se escribe SENTINELA_SIN_FECHA
-  //      cuando la columna aplica, para distinguir "recibida sin día"
-  //      de "no recibida aún".
   const _fRecep = (aplica, fechaExplicita) => {
     if (!aplica) return '';
     const src = (fechaExplicita != null && fechaExplicita !== '')
@@ -2368,24 +2482,24 @@ function agregarFacturaFront(datos) {
   const fila = [
     String(datos.numero).trim(), codigo, datos.cliente, datos.periodo, tipoNuevo,
     Number(datos.kwh) || 0, Number(datos.sum) || 0, Number(datos.peaje) || 0,
-    Number(datos.intereses) || 0, Number(datos.otros) || 0,
-    Number(datos.intPeaje) || 0, Number(datos.otrosPeaje) || 0,
+    Number(datos.intereses) || 0,
+    Number(datos.intPeaje) || 0,
     Number(datos.total) || 0,
     fC, fP, fE, fV, '', marcaProcesado
   ];
   const lr = sh.getLastRow() + 1;
-  // Fijar formatos ANTES de escribir para que las fechas queden como Date
   sh.getRange(lr, COL.CODIGO).setNumberFormat('@');
   sh.getRange(lr, COL.PERIODO).setNumberFormat('@');
   sh.getRange(lr, COL.FECHA_SUMINISTRO, 1, 4).setNumberFormat('dd/mm/yyyy');
   sh.getRange(lr, COL.KWH).setNumberFormat('#,##0.00');
-  sh.getRange(lr, COL.SUM, 1, 7).setNumberFormat('$#,##0');
+  sh.getRange(lr, COL.SUM, 1, 2).setNumberFormat('$#,##0');
+  sh.getRange(lr, COL.INT, 1, 2).setNumberFormat('$#,##0');
+  sh.getRange(lr, COL.TOTAL).setNumberFormat('$#,##0');
   if (marcaProcesado) sh.getRange(lr, COL.PROCESADO_MASIVO).setNumberFormat('yyyy-mm-dd hh:mm');
   sh.getRange(lr, 1, 1, fila.length).setValues([fila]);
   let pdfInfo = null;
   if (datos.pdfDriveUrl) {
     try {
-      // Fuente única de verdad del nombre → _construirNombreArchivoEstandar
       const nombreEst = _construirNombreArchivoEstandar({
         numero:  datos.numero,
         codigo:  codigo,
@@ -2397,8 +2511,6 @@ function agregarFacturaFront(datos) {
     } catch (e) { }
   }
 
-  // Marcar el PDF de esta factura como rectificado en el registro masivo,
-  // para que un repaso no vuelva a procesarlo.
   try { _marcarFacturaComoRectificadaEnRegistro(datos.numero); } catch (e) { }
 
   refrescarSeguimiento();
@@ -2434,9 +2546,7 @@ function actualizarFacturaFront(datos, idDrive) {
   celda(COL.SUM).setValue(_n(datos.sum));
   celda(COL.PEAJE).setValue(_n(datos.peaje));
   celda(COL.INT).setValue(_n(datos.intereses));
-  celda(COL.OTROS).setValue(_n(datos.otros));
   celda(COL.INT_PEAJE).setValue(_n(datos.intPeaje));
-  celda(COL.OTROS_PEAJE).setValue(_n(datos.otrosPeaje));
   celda(COL.TOTAL).setValue(_n(datos.total));
   const _setFecha = (col, iso) => {
     const c = celda(col);
@@ -2452,18 +2562,15 @@ function actualizarFacturaFront(datos, idDrive) {
     c.setNumberFormat('dd/mm/yyyy');
     c.setValue(new Date(p[0], p[1] - 1, p[2]));
   };
-  // ⚠ Sólo se escribe la fecha de recepción si el formulario la trae
-  //   explícitamente. Si viene vacía, se respeta el valor actual de la
-  //   celda (no se pisa con la fecha de hoy ni con un sentinel).
   const _fRecepVal = (aplica, fechaExplicita) => {
-    if (!aplica) return null;                 // null = no tocar
+    if (!aplica) return null;
     const src = (fechaExplicita != null && fechaExplicita !== '')
       ? fechaExplicita
       : datos.fecha;
-    if (!src) return null;                    // sin dato → no tocar
+    if (!src) return null;
     const s = String(src).trim();
     if (SENTINELAS.indexOf(s) !== -1) return s;
-    return s;                                 // ISO YYYY-MM-DD
+    return s;
   };
   const fC = _fRecepVal(
     tipoBuscado === 'CONSUMO' || tipoBuscado === 'SUMINISTRO' || tipoBuscado === 'UNIFICADA',
@@ -2491,8 +2598,6 @@ function actualizarFacturaFront(datos, idDrive) {
   celda(COL.PROCESADO_MASIVO).setValue(new Date()).setNumberFormat('yyyy-mm-dd hh:mm');
   _configCache = null;
 
-  // Marcar el PDF de esta factura como rectificado en el registro masivo,
-  // para que un repaso no vuelva a procesarlo.
   try { _marcarFacturaComoRectificadaEnRegistro(numBuscado); } catch (e) { }
 
   refrescarSeguimiento();
@@ -2501,14 +2606,6 @@ function actualizarFacturaFront(datos, idDrive) {
 
 function actualizarFacturaFrontBridge(datos, idDrive) { return actualizarFacturaFront(datos, idDrive); }
 
-/**
- * Actualiza sólo la columna "Procesadas" (PROCESADO_MASIVO) de la factura
- * indicada, sin tocar ningún otro campo. Se usa para marcar la factura
- * como "revisada" cuando se abre el modal, se compara contra el PDF y no
- * hay diferencias: al cerrar, el timestamp queda registrado.
- *
- * No lanza error si la factura no existe (silencioso por diseño).
- */
 function marcarFacturaRevisada(numero) {
   const num = String(numero || '').trim();
   if (!num) return { ok: false, error: 'Falta el N° de factura' };
@@ -2650,24 +2747,39 @@ function escribirHojaSeguimiento(ss, nombre, datosPorCodigo, config) {
     return MESES[parseInt(partes[1], 10) - 1] + '-' + partes[0];
   }));
   sh.getRange(1, 1, 1, headers.length).setValues([headers]);
-  const centrosVisibles = config.centros.filter(function(e){
+
+  let centrosVisibles = config.centros.filter(function (e) {
     return !_esCentroFantasmaBack(e.codigo, e.cliente);
   });
+
+  // ─── Arriendo de medidor: ocultar centros sin ninguna factura ───
+  //  En esta hoja no se espera factura en todos los períodos, así
+  //  que las filas de centros que nunca tuvieron arriendo en la
+  //  ventana visible se omiten por completo.
+  const esArriendo = (nombre === HOJA_ARRIENDO);
+  if (esArriendo) {
+    centrosVisibles = centrosVisibles.filter(function (e) {
+      const datos = datosPorCodigo[e.codigo] || {};
+      return Object.keys(datos).some(function (per) {
+        return (datos[per] || []).length > 0;
+      });
+    });
+  }
+
   const filas = centrosVisibles.map(function (e) {
     const fila = [e.cliente + ' (' + e.codigo + ')'];
     const datos = datosPorCodigo[e.codigo] || {};
     PERIODOS.forEach(function (periodo) {
       const items = datos[periodo] || [];
-      if (items.length === 0) fila.push(estadoTextoPeriodo(periodo));
-      else {
-        // Sólo cuentan como fechas reales las que no son sentinela.
+      if (items.length === 0) {
+        fila.push(esArriendo ? '—' : estadoTextoPeriodo(periodo));
+      } else {
         const fechas = items
           .map(f => f.fecha)
           .filter(x => x && SENTINELAS.indexOf(String(x)) === -1);
         if (fechas.length > 0) {
           fila.push(fechas.map(formatFechaCorta).join(' / '));
         } else {
-          // El documento existe (factura registrada), pero no se informó la fecha.
           const completo = items.every(it => it.completo);
           fila.push(completo ? 'Sin fecha' : 'Sin fecha (⚠)');
         }
@@ -2681,15 +2793,20 @@ function escribirHojaSeguimiento(ss, nombre, datosPorCodigo, config) {
     .setHorizontalAlignment('center').setVerticalAlignment('middle');
   if (filas.length) {
     const rango = sh.getRange(2, 2, filas.length, PERIODOS.length);
-    const reglas = [
-      SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Pendiente').setBackground('#fef3c7').setFontColor('#92400e').setRanges([rango]).build(),
-      SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Por Emitir').setBackground('#dcfce7').setFontColor('#166534').setRanges([rango]).build(),
-      SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('S/I').setBackground('#f3f4f6').setFontColor('#6b7280').setRanges([rango]).build(),
-      SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('N/A').setBackground('#e5e7eb').setFontColor('#6b7280').setRanges([rango]).build(),
+    const reglas = [];
+    if (!esArriendo) {
+      reglas.push(
+        SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Pendiente').setBackground('#fef3c7').setFontColor('#92400e').setRanges([rango]).build(),
+        SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Por Emitir').setBackground('#dcfce7').setFontColor('#166534').setRanges([rango]).build(),
+        SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('S/I').setBackground('#f3f4f6').setFontColor('#6b7280').setRanges([rango]).build(),
+        SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('N/A').setBackground('#e5e7eb').setFontColor('#6b7280').setRanges([rango]).build()
+      );
+    }
+    reglas.push(
       SpreadsheetApp.newConditionalFormatRule().whenTextContains('Sin fecha').setBackground('#e0f2fe').setFontColor('#075985').setRanges([rango]).build(),
       SpreadsheetApp.newConditionalFormatRule().whenTextContains('⚠').setBackground('#fef9c3').setFontColor('#b45309').setRanges([rango]).build(),
       SpreadsheetApp.newConditionalFormatRule().whenTextContains('/').setBackground('#d1fae5').setFontColor('#065f46').setRanges([rango]).build()
-    ];
+    );
     sh.setConditionalFormatRules(reglas);
   }
   sh.setColumnWidth(1, 260);
@@ -2732,18 +2849,20 @@ function importarFacturasFront(facturas) {
     const fV = f.fechaVencimiento ? parseISO(f.fechaVencimiento) : '';
     filas.push([String(f.numero).trim(), f.codigo || '', f.cliente, f.periodo, tipo,
     Number(f.kwh) || 0, Number(f.sum) || 0, Number(f.peaje) || 0,
-    Number(f.intereses) || 0, Number(f.otros) || 0,
-    Number(f.intPeaje) || 0, Number(f.otrosPeaje) || 0,
-    Number(f.total) || 0, fC, fP, fE, fV, '', '']);
+    Number(f.intereses) || 0,
+    Number(f.intPeaje) || 0,
+    Number(f.total) || 0,
+    fC, fP, fE, fV, '', '']);
   });
   if (filas.length) {
     const sr = sh.getLastRow() + 1;
-    // Fijar formatos ANTES del setValues para que las fechas queden como Date
     sh.getRange(sr, COL.CODIGO, filas.length, 1).setNumberFormat('@');
     sh.getRange(sr, COL.PERIODO, filas.length, 1).setNumberFormat('@');
     sh.getRange(sr, COL.FECHA_SUMINISTRO, filas.length, 4).setNumberFormat('dd/mm/yyyy');
     sh.getRange(sr, COL.KWH, filas.length, 1).setNumberFormat('#,##0.00');
-    sh.getRange(sr, COL.SUM, filas.length, 7).setNumberFormat('$#,##0');
+    sh.getRange(sr, COL.SUM, filas.length, 2).setNumberFormat('$#,##0');
+    sh.getRange(sr, COL.INT, filas.length, 2).setNumberFormat('$#,##0');
+    sh.getRange(sr, COL.TOTAL, filas.length, 1).setNumberFormat('$#,##0');
     sh.getRange(sr, 1, filas.length, filas[0].length).setValues(filas);
     refrescarSeguimiento();
   }
@@ -2756,17 +2875,13 @@ function importarFacturasFront(facturas) {
 function calcularResumen() {
   const facturas = leerResumen();
   const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
-  const acc = { total_facturas: facturas.length, total_suministro: 0, total_peaje: 0, total_intereses: 0, total_otros: 0, total_facturado: 0, recibidas: 0, pendientes: 0, porEmitir: 0, dentroPlazo: 0, sinInfo: 0, noAplica: 0 };
+  const acc = { total_facturas: facturas.length, total_suministro: 0, total_peaje: 0, total_intereses: 0, total_facturado: 0, recibidas: 0, pendientes: 0, porEmitir: 0, dentroPlazo: 0, sinInfo: 0, noAplica: 0 };
   facturas.forEach(function (f) {
     acc.total_suministro += f.sum; acc.total_peaje += f.peaje;
     acc.total_intereses += (f.intereses + (f.intPeaje || 0));
-    acc.total_otros += (f.otros + (f.otrosPeaje || 0));
     acc.total_facturado += f.total;
-    const _esSentinel = (v) => SENTINELAS.indexOf(String(v || '').trim()) !== -1;
     if (f.fechaConsumo === 'N/A' || f.fechaPeaje === 'N/A') { acc.noAplica++; return; }
     if (f.fechaConsumo === 'S/I' || f.fechaPeaje === 'S/I') { acc.sinInfo++; return; }
-    // 'Sin fecha' es un sentinel de recepción sin día: no cuenta como fecha real.
-    // (No lo clasificamos como S/I ni N/A, sino que cae al flujo de pendientes.)
     const _sinFechaConsumo = f.fechaConsumo === SENTINELA_SIN_FECHA;
     const _sinFechaPeaje   = f.fechaPeaje   === SENTINELA_SIN_FECHA;
     let tieneFecha;
@@ -2795,571 +2910,10 @@ function jsonResp(obj) { return ContentService.createTextOutput(JSON.stringify(o
 
 // ============================================================
 //  MENÚ
+//  El armado del menú vive en utilidades.gs (onOpen).
+//  Aquí sólo se conserva la constante de la hoja Config para
+//  que quede registrada la dependencia. Nada más.
 // ============================================================
-function onOpen() {
-  try {
-    const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_CONFIG);
-    if (sh) _asegurarColumnaEmpresa(sh);
-  } catch (e) { }
-  SpreadsheetApp.getUi()
-    .createMenu('⚡ Funciones adicionales')
-    .addItem('📂 Procesar carpeta de PDFs (masivo)', 'procesarCarpetaPDFsUI')
-    .addItem('📊 Ver registro de PDFs procesados', 'mostrarRegistroPDFsUI')
-    .addItem('🗑️ Limpiar registro de PDFs procesados', 'limpiarRegistroPDFsUI')
-    .addSeparator()
-    .addItem('🛑 Detener procesamiento indefinido', 'detenerProcesamientoIndefinidoUI')
-    .addItem('🏷️ Asegurar header "Procesado masivo"', 'asegurarHeaderProcesadoMasivo')
-    .addSeparator()
-    .addItem('🔄 Refrescar hojas de seguimiento', 'refrescarSeguimiento')
-    .addItem('🧪 Probar API', 'probarAPI')
-    .addItem('🤖 Probar Gemini', 'probarGemini')
-    .addItem('🔬 Probar parsing sobre texto (pegar en prompt)', 'probarParsingUI')
-    .addSeparator()
-    .addItem('📝 Renombrar PDFs vinculados (nuevo formato)', 'renombrarTodosLosPDFs')
-    .addItem('🔍 Previsualizar renombrado (sin aplicar)', 'previsualizarRenombradoPDFs')
-    .addSeparator()
-    .addItem('🔓 Desbloquear Drive OCR (reset cuota)', 'desbloquearDriveOcrUI')
-    .addSeparator()
-    .addItem('📅 Convertir fechas texto → Date (una vez)', 'convertirFechasTextoADate')
-    .addItem('🧹 Consolidar centro "Sin asignar" (una vez)', 'consolidarCentroSinAsignar')
-    .addItem('🔁 Migrar "Consumo" → "Suministro" (una vez)', 'migrarConsumoASuministro')
-    .addToUi();
-}
-
-function desbloquearDriveOcrUI() {
-  _desbloquearDriveOcr();
-  try { SpreadsheetApp.getUi().alert('✓ Drive OCR desbloqueado. Se reintentará en el próximo PDF.'); }
-  catch (e) { Logger.log('✓ Drive OCR desbloqueado'); }
-}
-
-function probarGemini() {
-  try {
-    if (!GEMINI_API_KEY || !String(GEMINI_API_KEY).trim()) {
-      mostrarMensajeSeguro('⚠ GEMINI_API_KEY no configurada.');
-      return;
-    }
-    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
-      GEMINI_MODEL + ':generateContent?key=' + encodeURIComponent(GEMINI_API_KEY);
-    const payload = { contents: [{ parts: [{ text: 'Responde únicamente con la palabra OK.' }] }] };
-    const res = UrlFetchApp.fetch(url, {
-      method: 'post', contentType: 'application/json',
-      payload: JSON.stringify(payload), muteHttpExceptions: true, timeout: 30
-    });
-    const code = res.getResponseCode();
-    const body = res.getContentText();
-    if (code !== 200) { mostrarMensajeSeguro('❌ HTTP ' + code + '\n\n' + body.slice(0, 500)); return; }
-    const json = JSON.parse(body);
-    const txt = (json.candidates && json.candidates[0] && json.candidates[0].content &&
-      json.candidates[0].content.parts && json.candidates[0].content.parts[0].text) || '(sin texto)';
-    mostrarMensajeSeguro('✓ Gemini OK\n\nModelo: ' + GEMINI_MODEL + '\nRespuesta: ' + txt.trim());
-  } catch (e) { mostrarMensajeSeguro('❌ ' + e.message); }
-}
-
-function probarParsingUI() {
-  const ui = SpreadsheetApp.getUi();
-  const r = ui.prompt('Probar parser', 'Pega el texto OCR crudo (se verá en el log de Apps Script):', ui.ButtonSet.OK_CANCEL);
-  if (r.getSelectedButton() !== ui.Button.OK) return;
-  const texto = r.getResponseText();
-  if (!texto) return;
-  _diagReset('(texto pegado)');
-  const campos = _parsearFacturaCompleta(texto);
-  _diagIntentar('Parser manual', true, { campos, chars: texto.length, preview: texto });
-  _diagReporteFinal(campos, 'Parser manual', _camposSonUtilizables(campos));
-  const det = _contarCamposDetectadosBack(campos);
-  ui.alert('✓ Parsing ejecutado\n\nCampos detectados: ' + det.total + '/' + det.totalClaves +
-    (det.faltantes.length ? '\nFaltan: ' + det.faltantes.join(', ') : '\n¡Completo!') +
-    '\n\nRevisa el log (Ver > Registros) para el reporte detallado.');
-}
-
-function detenerProcesamientoIndefinidoUI() {
-  _borrarEstadoPDF();
-  _limpiarTriggersPDF();
-  try { SpreadsheetApp.getUi().alert('🛑 Procesamiento detenido.'); } catch (e) { Logger.log('🛑 detenido'); }
-}
-
-function autorizarTodosLosScopes() {
-  DriveApp.getFiles();
-  Drive.Files.list({ maxResults: 1 });
-  SpreadsheetApp.getActiveSpreadsheet().getName();
-  const tmp = DocumentApp.create('tmp_auth_check');
-  DriveApp.getFileById(tmp.getId()).setTrashed(true);
-  PropertiesService.getScriptProperties().getKeys();
-  ScriptApp.getProjectTriggers();
-  UrlFetchApp.fetch('https://api.ocr.space/parse/image', {
-    method: 'post', payload: { apikey: 'helloworld', filetype: 'AUTO' }, muteHttpExceptions: true
-  });
-  UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models', {
-    method: 'get', muteHttpExceptions: true
-  });
-  Logger.log('✓ Autorización completa');
-  try { SpreadsheetApp.getUi().alert('✓ Permisos concedidos'); } catch (e) { }
-}
-
-function asegurarHeaderProcesadoMasivo() {
-  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
-  if (!sh) return;
-  const encabezados = [
-    { col: COL.INT_PEAJE, txt: 'Int. Peaje' },
-    { col: COL.OTROS_PEAJE, txt: 'Otros Peaje' },
-    { col: COL.TOTAL, txt: 'Total' },
-    { col: COL.FECHA_SUMINISTRO, txt: 'F.Recep Suministro' },
-    { col: COL.FECHA_PEAJE, txt: 'F.Recep Peaje' },
-    { col: COL.FECHA_EMISION, txt: 'F.Emisión' },
-    { col: COL.FECHA_VENC, txt: 'F.Venc' },
-    { col: COL.PDF_ID, txt: 'ID Drive' },
-    { col: COL.PROCESADO_MASIVO, txt: 'Procesadas' }
-  ];
-  encabezados.forEach(({ col, txt }) => {
-    const celda = sh.getRange(1, col);
-    if (!String(celda.getValue() || '').trim()) {
-      celda.setValue(txt).setFontWeight('bold').setBackground('#1e293b')
-        .setFontColor('#ffffff').setHorizontalAlignment('center');
-    }
-  });
-}
-
-function actualizarFacturaDesdePDF(datos, idDrive, tsProcesado) {
-  if (!datos || !datos.numero) return { ok: false, error: 'Falta el N° de factura' };
-  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
-  const data = sh.getDataRange().getValues();
-  const numBuscado = String(datos.numero).trim();
-  const tipoNuevo  = String(datos.tipo || '').toUpperCase();
-
-  // ─── Localizar la fila por N° Factura (identificador único) ───
-  let fila = -1;
-  for (let i = 1; i < data.length; i++) {
-    if (String(data[i][COL.NUMERO - 1]).trim() === numBuscado) { fila = i + 1; break; }
-  }
-  if (fila === -1) return { ok: false, error: 'Factura no encontrada: ' + numBuscado };
-
-  const campos = [];
-  const _track = (col, fn) => { if (fn()) campos.push(col); };
-
-  if (['SUMINISTRO','PEAJE','UNIFICADA','ARRIENDO_MEDIDOR'].indexOf(tipoNuevo) !== -1) {
-    sh.getRange(fila, COL.TIPO).setValue(tipoNuevo); campos.push(COL.TIPO);
-  }
-
-  // Centro de costo también se rectifica.
-  _track(COL.CLIENTE, () => _setCeldaTexto(sh, fila, COL.CLIENTE, datos.cliente));
-  _track(COL.CODIGO,  () => _setCeldaTexto(sh, fila, COL.CODIGO,  datos.codigo));
-
-  // Período: setValue con formato texto para no perder ceros.
-  if (datos.periodo && /^\d{4}-\d{2}$/.test(String(datos.periodo).trim())) {
-    const c = sh.getRange(fila, COL.PERIODO);
-    c.setValue(String(datos.periodo).trim());
-    c.setNumberFormat('@');
-    campos.push(COL.PERIODO);
-  }
-
-  _track(COL.KWH,         () => _setCeldaNum(sh, fila, COL.KWH,         datos.kwh));
-  _track(COL.SUM,         () => _setCeldaNum(sh, fila, COL.SUM,         datos.sum));
-  _track(COL.PEAJE,       () => _setCeldaNum(sh, fila, COL.PEAJE,       datos.peaje));
-  _track(COL.INT,         () => _setCeldaNum(sh, fila, COL.INT,         datos.intereses));
-  _track(COL.OTROS,       () => _setCeldaNum(sh, fila, COL.OTROS,       datos.otros));
-  _track(COL.INT_PEAJE,   () => _setCeldaNum(sh, fila, COL.INT_PEAJE,   datos.intPeaje));
-  _track(COL.OTROS_PEAJE, () => _setCeldaNum(sh, fila, COL.OTROS_PEAJE, datos.otrosPeaje));
-  _track(COL.TOTAL,       () => _setCeldaNum(sh, fila, COL.TOTAL,       datos.total));
-  _track(COL.FECHA_EMISION, () => _setCeldaFecha(sh, fila, COL.FECHA_EMISION, datos.fechaEmision));
-  _track(COL.FECHA_VENC,    () => _setCeldaFecha(sh, fila, COL.FECHA_VENC,    datos.fechaVencimiento));
-
-  // ⚠ F.Recep Consumo / F.Recep Peaje: sólo se escriben si el caller las
-  //   pasa EXPLÍCITAMENTE y no vacías. El procesador masivo pasa '' para
-  //   ambas, por lo que nunca pisa una fecha ya registrada por el usuario.
-  if (datos.fechaConsumo != null && datos.fechaConsumo !== '') {
-    _track(COL.FECHA_SUMINISTRO, () => _setCeldaFecha(sh, fila, COL.FECHA_SUMINISTRO, datos.fechaConsumo));
-  }
-  if (datos.fechaPeaje != null && datos.fechaPeaje !== '') {
-    _track(COL.FECHA_PEAJE, () => _setCeldaFecha(sh, fila, COL.FECHA_PEAJE, datos.fechaPeaje));
-  }
-
-  let idFinal = '';
-  if (idDrive) {
-    const c = sh.getRange(fila, COL.PDF_ID);
-    c.setValue(String(idDrive).trim()).setNumberFormat('@');
-    idFinal = idDrive; campos.push(COL.PDF_ID);
-  }
-
-  const cTs = sh.getRange(fila, COL.PROCESADO_MASIVO);
-  cTs.setValue(tsProcesado instanceof Date ? tsProcesado : new Date());
-  cTs.setNumberFormat('yyyy-mm-dd hh:mm');
-  campos.push(COL.PROCESADO_MASIVO);
-
-  return { ok: true, fila: fila, campos: campos, idDrive: idFinal };
-}
-
-function obtenerInfoFactura(numero, tipo) {
-  if (!numero) return { ok: false, error: 'Falta N° de factura' };
-  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
-  if (!sh) return { ok: false, error: 'No existe hoja Resumen' };
-  const data = sh.getDataRange().getValues();
-  const numBuscado = String(numero).trim();
-  for (let i = 1; i < data.length; i++) {
-    if (String(data[i][COL.NUMERO - 1]).trim() !== numBuscado) continue;
-    const fila = i + 1;
-    const pdfId = String(data[i][COL.PDF_ID - 1] || '').trim();
-    const tsRaw = data[i][COL.PROCESADO_MASIVO - 1];
-    const ts = (tsRaw instanceof Date && !isNaN(tsRaw.getTime())) ? tsRaw : null;
-    return { ok: true, fila: fila, pdfId: pdfId, procesadoMasivo: ts };
-  }
-  return { ok: false, error: 'Factura no encontrada' };
-}
-
-function asegurarCentroTemporal() {
-  const CODIGO_TEMP = 'Sin código';
-  const CLIENTE_TEMP = 'Sin asignar';
-  const ss = SpreadsheetApp.openById(SS_ID);
-  let sh = ss.getSheetByName(HOJA_CONFIG);
-  if (!sh) { _configCache = null; leerConfig(); sh = ss.getSheetByName(HOJA_CONFIG); }
-  const lr = Math.max(sh.getLastRow(), 1);
-  if (lr >= 2) {
-    const vals = sh.getRange(2, 3, lr - 1, 2).getValues();
-    for (let i = 0; i < vals.length; i++) {
-      const c = String(vals[i][0] || '').trim();
-      const n = String(vals[i][1] || '').trim();
-      // Reconoce cualquier variante previa (TEMP / ⚠️ Sin asignar / Sin asignar)
-      if (_esCentroFantasmaBack(c, n)) {
-        _configCache = null;
-        return { ok: true, codigo: c || CODIGO_TEMP, cliente: n || CLIENTE_TEMP };
-      }
-    }
-  }
-  _asegurarColumnaEmpresa(sh);
-  const nextRow = lr + 1;
-  sh.getRange(nextRow, 2, 1, 9).setValues([['', CODIGO_TEMP, CLIENTE_TEMP, '', '', '', '', '', 'EMOAC']]);
-  _configCache = null;
-  return { ok: true, codigo: CODIGO_TEMP, cliente: CLIENTE_TEMP };
-}
-
-function probarAPI() {
-  try {
-    const k = calcularResumen();
-    mostrarMensajeSeguro(
-      '✓ API funcionando\n\nFacturas: ' + k.total_facturas +
-      '\nRecibidas: ' + k.recibidas +
-      '\nPendientes: ' + k.pendientes +
-      '\nDentro del plazo: ' + k.dentroPlazo +
-      '\nPor emitir: ' + k.porEmitir +
-      '\nS/I: ' + k.sinInfo +
-      '\nN/A: ' + k.noAplica +
-      '\n\n🤖 Gemini: ' + (GEMINI_API_KEY ? 'configurada' : 'NO configurada')
-    );
-  } catch (e) { mostrarMensajeSeguro('❌ ' + e.message); }
-}
-
-function reautorizar() { autorizarTodosLosScopes(); }
-
-function normalizarAliasClientes() {
-  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Resumen Facturación');
-  const data = sh.getDataRange().getValues();
-  const MAPA = {
-    'Gildemeister (SB)': 'Gildemeister SB',
-    'StgoDowntown Torre 4 y 7 (4051)': 'StgoDowntown',
-    'StgoDowntown Torre 4 y 7 (4052)': 'StgoDowntown',
-    'COMUNIDAD EDIFICIO NERUDA': 'Neruda'
-  };
-  const COL_CLIENTE = 4;
-  let cambios = 0;
-  for (let i = 1; i < data.length; i++) {
-    const actual = String(data[i][COL_CLIENTE - 1] || '').trim();
-    if (MAPA[actual]) { sh.getRange(i + 1, COL_CLIENTE).setValue(MAPA[actual]); cambios++; }
-  }
-  SpreadsheetApp.getUi().alert('✓ Nombres normalizados: ' + cambios);
-}
-
-/* ============================================================
- *  PROCESADOR MASIVO DE PDFs (v5) — con diagnóstico
- * ============================================================ */
-
-const HOJA_PDF_PROCESADOS = '_PDF_Procesados';
-const TIEMPO_MAX_MS = 5 * 60 * 1000;
-const PROP_KEY_ESTADO_PDF = 'EMOAC_PDF_STATE_V1';
-const ESTADOS_PROCESADOS = { ok: 1, rectificada: 1 };
-const ESTADOS_REINTENTABLES = { error_ocr: 1, error_parseo: 1 };
-
-function procesarCarpetaPDFsUI() {
-  const ui = SpreadsheetApp.getUi();
-  const r1 = ui.prompt('Paso 1/3 — Carpeta', 'Pega la URL o el ID de la carpeta de Drive a procesar.\nSe recorrerán también las subcarpetas.', ui.ButtonSet.OK_CANCEL);
-  if (r1.getSelectedButton() !== ui.Button.OK) return;
-  const url = r1.getResponseText().trim();
-  if (!url) { ui.alert('No se ingresó URL/ID.'); return; }
-
-  const r2 = ui.alert('Paso 2/3 — Cobertura', '¿Deseas OMITIR los PDFs ya procesados?', ui.ButtonSet.YES_NO_CANCEL);
-  if (r2 === ui.Button.CANCEL) return;
-  const omitirProcesados = (r2 === ui.Button.YES);
-
-  const r3 = ui.alert('Paso 3/3 — Facturas recientes', '¿Deseas OMITIR las facturas procesadas hace menos de 1 día?', ui.ButtonSet.YES_NO_CANCEL);
-  if (r3 === ui.Button.CANCEL) return;
-  const omitirRecientes = (r3 === ui.Button.YES);
-
-  const _limpieza = _limpiarReintentablesDelRegistro();
-  const estado = {
-    url: url, modo: 3,
-    incluirProcesados: !omitirProcesados,
-    reprocesarRecientes: !omitirRecientes,
-    reintentablesLimpiados: _limpieza.borradas + _limpieza.rectificadas,
-    gemini: !!(GEMINI_API_KEY && String(GEMINI_API_KEY).trim()),
-    creado: new Date().toISOString()
-  };
-  _guardarEstadoPDF(estado);
-  _limpiarTriggersPDF();
-  asegurarHeaderProcesadoMasivo();
-
-  let resultado;
-  try { resultado = _ejecutarLotePDF(estado); }
-  catch (e) { ui.alert('❌ Error: ' + e.message); return; }
-
-  if (resultado.tiempoAgotado) {
-    _programarSiguienteEjecucionPDF();
-    try { SpreadsheetApp.getActiveSpreadsheet().toast('⏳ Procesamiento en curso. Siguiente tanda ~1 min.', 'Procesamiento masivo', 15); } catch (e) { }
-    return;
-  }
-  _borrarEstadoPDF();
-  _limpiarTriggersPDF();
-  const msg = _resumenResultado(resultado, estado) + '\n\n✅ Procesamiento completo.';
-  try { ui.alert(msg); }
-  catch (e) {
-    try { SpreadsheetApp.getActiveSpreadsheet().toast('✅ Procesamiento completo · ' + resultado.ok + ' facturas', 'Procesamiento masivo', 30); } catch (e2) { }
-  }
-}
-
-function _continuarEjecucionPDF() {
-  const estado = _leerEstadoPDF();
-  if (!estado) { _limpiarTriggersPDF(); return; }
-  let resultado;
-  try { resultado = _ejecutarLotePDF(estado); }
-  catch (e) { Logger.log('Error continuación: ' + e.message); _borrarEstadoPDF(); _limpiarTriggersPDF(); return; }
-  if (resultado.tiempoAgotado) { _programarSiguienteEjecucionPDF(); return; }
-  _borrarEstadoPDF();
-  _limpiarTriggersPDF();
-  const msg = _resumenResultado(resultado, estado) + '\n\n✅ Procesamiento completo.';
-  try { SpreadsheetApp.getActiveSpreadsheet().toast('✅ ' + resultado.ok + ' facturas · ' + resultado.errores + ' errores', 'Procesamiento masivo', 30); } catch (e) { }
-  try {
-    const email = Session.getEffectiveUser().getEmail();
-    MailApp.sendEmail({ to: email, subject: '✅ Procesamiento masivo terminado', body: msg + '\n\nRevisa "' + HOJA_PDF_PROCESADOS + '" para el detalle.' });
-  } catch (e) { Logger.log('No se pudo enviar email: ' + e.message); }
-  Logger.log(msg);
-}
-
-function _guardarEstadoPDF(estado) { PropertiesService.getScriptProperties().setProperty(PROP_KEY_ESTADO_PDF, JSON.stringify(estado)); }
-function _leerEstadoPDF() {
-  const s = PropertiesService.getScriptProperties().getProperty(PROP_KEY_ESTADO_PDF);
-  if (!s) return null;
-  try { return JSON.parse(s); } catch (e) { return null; }
-}
-function _borrarEstadoPDF() { PropertiesService.getScriptProperties().deleteProperty(PROP_KEY_ESTADO_PDF); }
-function _programarSiguienteEjecucionPDF() {
-  _limpiarTriggersPDF();
-  ScriptApp.newTrigger('_continuarEjecucionPDF').timeBased().after(60 * 1000).create();
-}
-function _limpiarTriggersPDF() {
-  ScriptApp.getProjectTriggers().forEach(t => {
-    if (t.getHandlerFunction() === '_continuarEjecucionPDF') {
-      try { ScriptApp.deleteTrigger(t); } catch (e) { }
-    }
-  });
-}
-
-function _registrarPDFEnDup(dupRegistro, numero, tipo, id, path, paginas) {
-  if (!dupRegistro || !id) return;
-  const num = String(numero || '').trim();
-  const tpo = String(tipo || '').toUpperCase();
-  if (!num || !tpo) return;
-  const key = num + '|' + tpo;
-  if (!dupRegistro[key]) dupRegistro[key] = [];
-  if (dupRegistro[key].some(a => a.id === id)) return;
-  dupRegistro[key].push({ id, path: path || '', paginas: Number(paginas) || 0 });
-}
-
-function _calcularDuplicados(dupRegistro) {
-  const resultado = [];
-  Object.entries(dupRegistro || {}).forEach(([key, archivos]) => {
-    if (!archivos || archivos.length < 2) return;
-    const [numero, tipo] = key.split('|');
-    resultado.push({ numero, tipo, archivos: archivos.slice().sort((a, b) => a.id.localeCompare(b.id)) });
-  });
-  resultado.sort((a, b) => a.numero.localeCompare(b.numero));
-  return resultado;
-}
-
-function _ejecutarLotePDF(estado) {
-  const folderId = parseDriveId(estado.url);
-  if (!folderId) throw new Error('URL/ID inválido.');
-  let folder;
-  try { folder = DriveApp.getFolderById(folderId); }
-  catch (e) { throw new Error('No se pudo acceder a la carpeta: ' + e.message); }
-
-  const pdfs = [];
-  _listarPDFsRecursivo(folder, pdfs, '');
-  const totalEncontrados = pdfs.length;
-
-  const reg = cargarRegistroPDFs();
-  let lista = pdfs.slice();
-  let totalFiltradosPorRegistro = 0;
-  if (!estado.incluirProcesados) {
-    const antes = lista.length;
-    lista = lista.filter(p => {
-      let id;
-      try { id = p.file.getId(); } catch (e) { return false; }
-      const prev = reg[id];
-      return !prev || !ESTADOS_PROCESADOS[prev.estado];
-    });
-    totalFiltradosPorRegistro = antes - lista.length;
-  }
-
-  lista.sort((a, b) => {
-    let da, db;
-    try { da = a.file.getDateCreated().getTime(); } catch (e) { da = 0; }
-    try { db = b.file.getDateCreated().getTime(); } catch (e) { db = 0; }
-    return db - da;
-  });
-
-  const inicio = Date.now();
-  const delayMs = estado.modo === 3 ? 120000 : 0;
-  const resultado = {
-    total: lista.length, procesados: 0, saltados: 0,
-    ok: 0, duplicadas: 0, rectificadas: 0, revManual: 0, errores: 0,
-    restantes: 0, tiempoAgotado: false, detalle: [], duplicados: [],
-    totalEncontrados, totalFiltradosPorRegistro,
-    gemini: !!estado.gemini
-  };
-  const dupRegistro = {};
-
-  asegurarCentroTemporal();
-  const existentes = leerResumen();
-  const config = leerConfig();
-
-  for (let i = 0; i < lista.length; i++) {
-    if (Date.now() - inicio > TIEMPO_MAX_MS) {
-      resultado.tiempoAgotado = true;
-      resultado.restantes = lista.length - i;
-      break;
-    }
-    const item = lista[i];
-    let fileId;
-    try { fileId = item.file.getId(); } catch (e) { fileId = ''; }
-
-    if (fileId && !estado.incluirProcesados) {
-      const prev = reg[fileId];
-      if (prev && ESTADOS_PROCESADOS[prev.estado]) { resultado.saltados++; continue; }
-    }
-
-    if (delayMs > 0 && resultado.procesados > 0) {
-      if (Date.now() - inicio + delayMs > TIEMPO_MAX_MS) {
-        resultado.tiempoAgotado = true;
-        resultado.restantes = lista.length - i;
-        break;
-      }
-      Utilities.sleep(delayMs);
-    }
-
-    const r = _procesarUnPDF(item, existentes, config, true, {
-      reprocesarRecientes: !!estado.reprocesarRecientes,
-      dupRegistro
-    });
-
-    if (fileId) {
-      const _detalleFinal = [r.detalle, r.diag].filter(Boolean).join('  ||  ');
-      reg[fileId] = {
-        path: item.path,
-        estado: r.estado,
-        detalle: _detalleFinal,
-        ts: new Date().toISOString(),
-        numero: r.numeroFactura || ''
-      };
-    }
-
-    if (r.estado === 'ok') resultado.ok++;
-    else if (r.estado === 'rectificada') resultado.rectificadas++;
-    else if (r.estado === 'rev_manual') resultado.revManual++;
-    else if (r.estado === 'duplicada') resultado.duplicadas++;
-    else resultado.errores++;
-    resultado.procesados++;
-
-    if (r.estado === 'rev_manual') resultado.detalle.push({ archivo: item.path, revision: r.detalle, warning: r.warning });
-    else if (r.detalle && r.estado !== 'ok' && r.estado !== 'duplicada') resultado.detalle.push({ archivo: item.path, error: r.detalle });
-    else if (r.warning) resultado.detalle.push({ archivo: item.path, warning: r.warning });
-
-    guardarRegistroPDFs(reg);
-  }
-
-  guardarRegistroPDFs(reg);
-  refrescarSeguimiento();
-  resultado.duplicados = _calcularDuplicados(dupRegistro);
-  Logger.log(JSON.stringify(resultado, null, 2));
-  return resultado;
-}
-
-function _resumenResultado(r, estado) {
-  const lineas = [];
-  const modoTxt = estado.modo === 1 ? 'una vez' : estado.modo === 3 ? 'indefinido con pausas' : ('modo ' + estado.modo);
-  const coberturaTxt = estado.incluirProcesados ? 'TODOS' : 'solo NO procesados';
-  const motorTxt = estado.gemini ? 'OCR primero · Gemini como último recurso' : 'OCR tradicional';
-  lineas.push('📊 Resultado del lote');
-  lineas.push('');
-  lineas.push('Modo:      ' + modoTxt);
-  lineas.push('Cobertura: ' + coberturaTxt);
-  lineas.push('Motor:     ' + motorTxt);
-  lineas.push('');
-  lineas.push('PDFs en carpeta:      ' + (r.totalEncontrados != null ? r.totalEncontrados : '?'));
-  if (r.totalFiltradosPorRegistro > 0) lineas.push('  · Ya procesados:    ' + r.totalFiltradosPorRegistro);
-  lineas.push('PDFs en lote:         ' + r.total);
-  lineas.push('Saltados (registro):  ' + r.saltados);
-  lineas.push('Procesados:          ' + r.procesados);
-  lineas.push('  · Creadas:         ' + r.ok);
-  lineas.push('  · Rectificadas:    ' + (r.rectificadas || 0));
-  lineas.push('  · Rev. manual:     ' + (r.revManual || 0));
-  lineas.push('  · Duplicadas:      ' + r.duplicadas);
-  lineas.push('  · Errores:         ' + r.errores);
-  if (r.tiempoAgotado) { lineas.push(''); lineas.push('⏸️ Restantes: ' + r.restantes); }
-
-  const conProblemas = (r.detalle || []).filter(d => d.error || d.warning || d.revision);
-  if (conProblemas.length) {
-    lineas.push('');
-    lineas.push('Detalle (primeros 15):');
-    conProblemas.slice(0, 15).forEach(d => {
-      lineas.push('· ' + d.archivo);
-      if (d.revision) { lineas.push('   [rev_manual] ' + (d.warning || '')); d.revision.split('\n').forEach(l => lineas.push('   ' + l)); }
-      else lineas.push('   ' + (d.error || d.warning));
-    });
-  }
-
-  const dups = (r.duplicados || []);
-  if (dups.length) {
-    lineas.push('');
-    lineas.push('🔍 Duplicados detectados:');
-    dups.forEach(d => {
-      lineas.push('');
-      lineas.push('  ' + d.numero + ' · ' + d.tipo);
-      d.archivos.forEach(a => lineas.push('    ' + a.id + ' (' + a.paginas + ' páginas)'));
-    });
-  }
-  return lineas.join('\n');
-}
-
-function mostrarRegistroPDFsUI() {
-  const ui = SpreadsheetApp.getUi();
-  const reg = cargarRegistroPDFs();
-  const total = Object.keys(reg).length;
-  if (!total) { ui.alert('El registro está vacío.'); return; }
-  const porEstado = {};
-  Object.values(reg).forEach(v => { porEstado[v.estado] = (porEstado[v.estado] || 0) + 1; });
-  const lineas = ['📋 Registro de PDFs procesados', '', 'Total: ' + total, ''];
-  Object.keys(porEstado).sort().forEach(k => lineas.push('  · ' + k + ': ' + porEstado[k]));
-  lineas.push('');
-  lineas.push('Detalle en la hoja oculta "' + HOJA_PDF_PROCESADOS + '".');
-  ui.alert(lineas.join('\n'));
-}
-
-function limpiarRegistroPDFsUI() {
-  const ui = SpreadsheetApp.getUi();
-  const reg = cargarRegistroPDFs();
-  const total = Object.keys(reg).length;
-  if (!total) { ui.alert('El registro ya está vacío.'); return; }
-  const r = ui.alert('🗑️ Limpiar registro', 'Se borrarán ' + total + ' entradas.\n\nLa próxima ejecución procesará TODOS los PDFs.', ui.ButtonSet.YES_NO);
-  if (r !== ui.Button.YES) return;
-  limpiarRegistroPDFs();
-  ui.alert('✓ Registro limpiado.');
-}
 
 function _getHojaProcesados(ss) {
   let sh = ss.getSheetByName(HOJA_PDF_PROCESADOS);
@@ -3437,8 +2991,6 @@ function limpiarRegistroPDFs() {
   _aplicarFiltroProcesados(sh);
 }
 
-function _esReintentable(estado) { return !!ESTADOS_REINTENTABLES[estado]; }
-
 function _fechasProcesadasPorFactura() {
   const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
   if (!sh) return {};
@@ -3491,12 +3043,6 @@ function _extraerNumeroDePath(path) {
   return '';
 }
 
-/**
- * Marca como "rectificada" todas las entradas del registro
- * `_PDF_Procesados` cuyo N° de factura coincida, y refresca su ts.
- * Con esto, un repaso masivo no volverá a procesar esos PDFs
- * (porque 'rectificada' está en ESTADOS_PROCESADOS).
- */
 function _marcarFacturaComoRectificadaEnRegistro(numero) {
   const num = String(numero || '').trim();
   if (!num) return { actualizadas: 0 };
@@ -3514,7 +3060,7 @@ function _marcarFacturaComoRectificadaEnRegistro(numero) {
     ).trim();
 
     if (numEntrada !== num) return;
-    if (entrada.estado === 'rectificada') return;  // ya está marcada, no tocar
+    if (entrada.estado === 'rectificada') return;
 
     entrada.estado = 'rectificada';
     entrada.ts = ahora;
@@ -3554,8 +3100,6 @@ function _diffFacturaPDF(facturaExistente, campos) {
   _pushDif(facturaExistente.peaje, campos.fPeaje, true, 'Peaje');
   _pushDif(facturaExistente.intereses, campos.fInt, true, 'Int. Sum.');
   _pushDif(facturaExistente.intPeaje, campos.fIntPeaje, true, 'Int. Peaje');
-  _pushDif(facturaExistente.otros, campos.fOtros, true, 'Otros Sum.');
-  _pushDif(facturaExistente.otrosPeaje, campos.fOtrosPeaje, true, 'Otros Peaje');
   _pushDif(facturaExistente.total, campos.fTotal, true, 'Total');
   return diffs;
 }
@@ -3573,7 +3117,6 @@ function _procesarUnPDF_interno(item, existentes, config, copiarADestinos, opcio
   opciones = opciones || {};
   const file = item.file;
 
-  // 1) Obtener base64
   let base64, mime;
   try {
     const blob = file.getBlob();
@@ -3583,7 +3126,6 @@ function _procesarUnPDF_interno(item, existentes, config, copiarADestinos, opcio
     return { estado: 'error_ocr', detalle: 'Lectura falló: ' + e.message };
   }
 
-  // 2) Cascada: Drive OCR → OCR.space → Gemini
   let campos = null;
   let motorUsado = '';
   let mejorScore = -1;
@@ -3601,7 +3143,6 @@ function _procesarUnPDF_interno(item, existentes, config, copiarADestinos, opcio
     return _camposSonUtilizables(c);
   };
 
-  // 2.1) Drive OCR — sólo si no está bloqueado por cuota
   if (_driveOcrEstaBloqueado()) {
     _diagIntentar('Drive OCR', false, { error: 'Cuota agotada (saltado)' });
   } else {
@@ -3618,7 +3159,6 @@ function _procesarUnPDF_interno(item, existentes, config, copiarADestinos, opcio
     }
   }
 
-  // 2.2) OCR.space
   const r2 = _extraerConOCRSpace(file.getName(), base64, mime);
   if (r2.ok && r2.texto) {
     const c2 = _parsearFacturaCompleta(r2.texto);
@@ -3631,7 +3171,6 @@ function _procesarUnPDF_interno(item, existentes, config, copiarADestinos, opcio
     _diagIntentar('OCR.space', false, { error: r2.error });
   }
 
-  // 2.3) Gemini — ÚLTIMO RECURSO
   if (GEMINI_API_KEY && String(GEMINI_API_KEY).trim()) {
     const g = _extraerConGemini(base64, mime, file.getName());
     if (g.ok && g.campos) {
@@ -3647,13 +3186,11 @@ function _procesarUnPDF_interno(item, existentes, config, copiarADestinos, opcio
     _diagIntentar('Gemini', false, { error: 'No configurado' });
   }
 
-  // 3) Ningún resultado utilizable → usar el mejor parcial
   _diagReporteFinal(mejorCampos, mejorMotor || '(ninguna)', false);
 
   if (!mejorCampos) {
     return { estado: 'error_ocr', detalle: 'Ninguna fuente pudo extraer campos' };
   }
-
   if (!mejorCampos.fNumero) {
     return { estado: 'error_parseo', detalle: 'No se detectó N° factura [mejor fuente: ' + mejorMotor + ']' };
   }
@@ -3668,47 +3205,7 @@ function _procesarUnPDF_interno(item, existentes, config, copiarADestinos, opcio
 }
 
 
-/**
- * Copia el PDF a los destinos del centro (Operaciones + Comunidad)
- * con el nombre estándar y vincula el archivo resultante a la factura.
- *
- * @returns {{ ok:boolean, idFinal:string, warning:string }}
- */
-function _copiarYVincularPDF(file, numero, codigo, periodo, tipo, centro) {
-  const nombreEst = _construirNombreArchivoEstandar({
-    numero:  numero,
-    codigo:  codigo,
-    periodo: periodo,
-    tipo:    tipo
-  }, centro);
 
-  let idFinal = '';
-  let warning = '';
-
-  if (!(centro.driveOp || centro.driveCom)) {
-    return { ok: true, idFinal: '', warning: '' };   // nada que hacer
-  }
-
-  try {
-    const copia = copiarPDFDriveADestinos(file.getId(), centro.codigo, nombreEst);
-    if (copia.ok && copia.archivos && copia.archivos.length) {
-      idFinal = copia.archivos[0].id;
-      const vinc = vincularPDFDrive(numero, idFinal, nombreEst);
-      if (!vinc.ok && vinc.error) {
-        warning = 'PDF copiado pero no vinculado: ' + vinc.error;
-      }
-    } else if (!copia.ok) {
-      warning = 'PDF no copiado: ' + (copia.error || 'sin detalle');
-    }
-  } catch (e) {
-    warning = 'PDF no copiado: ' + e.message;
-  }
-
-  return { ok: !warning, idFinal, warning };
-}
-/**
- * Aplica los campos extraídos al proceso masivo (crear/rectificar factura).
- */
 function _finalizarProcesamientoPDF(item, campos, motorUsado, existentes, config, copiarADestinos, opciones) {
   const file = item.file;
   const _normCod = (s) => String(s || '').trim().replace(/[\.\s\-]/g, '').toUpperCase();
@@ -3764,24 +3261,30 @@ function _finalizarProcesamientoPDF(item, campos, motorUsado, existentes, config
       if (edadMs < UN_DIA_MS) return { estado: 'duplicada', detalle: '', warning: 'Omitida: procesada <1 día' };
     }
 
-    const paginasNuevo = _contarPaginasPdf(file);
-    const pdfIdActual = info.ok ? info.pdfId : '';
-    const paginasActual = pdfIdActual ? _contarPaginasPdf(pdfIdActual) : 0;
-    let reemplazar = false;
-    if (!pdfIdActual) reemplazar = true;
-    else if (paginasNuevo > paginasActual) reemplazar = true;
-
-    // Si hay que reemplazar el PDF: copiarlo a los destinos con el nombre
-    // estándar y quedarnos con el ID nuevo. Misma lógica que al crear.
-    let idDriveFinal = '';
-    if (reemplazar && copiarADestinos) {
-      const rCop = _copiarYVincularPDF(
-        file, campos.fNumero, centroFinal.codigo, campos.fPeriodo, tipo, centroFinal
+    // ─── Reemplazo inteligente por cantidad de páginas ─────────────
+    //  Toda la lógica de sustitución (más páginas gana; limpieza en
+    //  DriveOp/DriveCom/"Sin asignar") vive en reemplazarYDistribuirPDF().
+    const _nombreEstReemplazo = _construirNombreArchivoEstandar(campos, centroFinal);
+    let rReemplazo;
+    try {
+      rReemplazo = reemplazarYDistribuirPDF(
+        String(campos.fNumero).trim(),
+        file.getId(),
+        copiarADestinos ? centroFinal.codigo : '',
+        _nombreEstReemplazo
       );
-      if (rCop.idFinal) idDriveFinal = rCop.idFinal;
-      // El warning se propaga al warningFinal (abajo).
-      if (rCop.warning) warningCentro += ' · ' + rCop.warning;
+    } catch (e) {
+      return { estado: 'error_otro', detalle: 'Reemplazo PDF: ' + e.message };
     }
+    if (!rReemplazo.ok) {
+      return { estado: 'error_otro', detalle: 'Reemplazo PDF: ' + rReemplazo.error };
+    }
+
+    const idDriveFinal = rReemplazo.pdfId || '';
+    const reemplazar   = !!rReemplazo.reemplazado;
+    const pdfIdActual  = info.ok ? info.pdfId : '';
+    const paginasNuevo  = _contarPaginasPdf(file);
+    const paginasActual = pdfIdActual ? _contarPaginasPdf(pdfIdActual) : 0;
 
     let rRect = { ok: false };
     try {
@@ -3793,13 +3296,8 @@ function _finalizarProcesamientoPDF(item, campos, motorUsado, existentes, config
         periodo: campos.fPeriodo || '',
         kwh: campos.fKwh, sum: campos.fSum, peaje: campos.fPeaje,
         intereses: campos.fInt, intPeaje: campos.fIntPeaje,
-        otros: campos.fOtros, otrosPeaje: campos.fOtrosPeaje,
         total: campos.fTotal,
         fechaEmision: campos.fEmision, fechaVencimiento: campos.fVencimiento,
-        // ⚠ La fecha de recepción NO se infiere del PDF ni del momento
-        //   del procesamiento: debe quedar vacía para que el usuario la
-        //   registre manualmente desde el modal o al hacer click en la
-        //   celda del Seguimiento.
         fechaConsumo: '', fechaPeaje: ''
       }, idDriveFinal, new Date());
     } catch (e) { return { estado: 'error_otro', detalle: 'Rectificar: ' + e.message }; }
@@ -3807,24 +3305,20 @@ function _finalizarProcesamientoPDF(item, campos, motorUsado, existentes, config
 
     const diffs = _diffFacturaPDF(dup, campos);
     let msgPag = reemplazar
-      ? (pdfIdActual ? 'Reemplazado (' + paginasNuevo + '>' + paginasActual + ')' : 'Vinculado (' + paginasNuevo + ')')
-      : 'Rectificada';
+      ? ('Reemplazado · ' + (rReemplazo.motivo || ''))
+      : ('Rectificada · ' + (rReemplazo.motivo || ''));
     const warningFinal = msgPag + ' · Motor: ' + motorUsado;
 
     if (diffs.length) return { estado: 'rev_manual', detalle: 'Diferencias:\n' + diffs.join('\n'), warning: warningFinal };
     return { estado: 'rectificada', detalle: '', warning: warningFinal };
   }
 
-  // Crear factura nueva
   const datos = {
     numero: String(campos.fNumero).trim(),
     codigo: centroFinal.codigo,
     cliente: centroFinal.cliente,
     periodo: campos.fPeriodo,
     tipo: tipo,
-    // ⚠ La fecha de recepción NO se infiere del PDF ni del momento del
-    //   procesamiento masivo. Se deja en blanco para que el usuario la
-    //   registre manualmente al hacer click en la celda del Seguimiento.
     fecha: '',
     fechaConsumo: '',
     fechaPeaje: '',
@@ -3832,7 +3326,6 @@ function _finalizarProcesamientoPDF(item, campos, motorUsado, existentes, config
     fechaVencimiento: campos.fVencimiento || '',
     kwh: campos.fKwh || 0, sum: campos.fSum || 0, peaje: campos.fPeaje || 0,
     intereses: campos.fInt || 0, intPeaje: campos.fIntPeaje || 0,
-    otros: campos.fOtros || 0, otrosPeaje: campos.fOtrosPeaje || 0,
     total: campos.fTotal || 0,
     pdfDriveUrl: '',
     procesadoMasivo: true
@@ -3841,9 +3334,6 @@ function _finalizarProcesamientoPDF(item, campos, motorUsado, existentes, config
   try { agregarFacturaFront(datos); }
   catch (e) { return { estado: 'error_otro', detalle: 'Al guardar: ' + e.message }; }
 
-  // ─── Copiar el PDF a los destinos del centro y vincularlo a la
-  //     factura recién creada. Se usa la MISMA función que en la rama
-  //     "duplicada": _construirNombreArchivoEstandar → nombre único.
   let warning = '';
   if (copiarADestinos && (centroFinal.driveOp || centroFinal.driveCom)) {
     const nombreEst = _construirNombreArchivoEstandar(campos, centroFinal);
@@ -3851,7 +3341,6 @@ function _finalizarProcesamientoPDF(item, campos, motorUsado, existentes, config
       const copia = copiarPDFDriveADestinos(file.getId(), centroFinal.codigo, nombreEst);
       if (copia.ok && copia.archivos && copia.archivos.length) {
         const idCopia = copia.archivos[0].id;
-        // Vincular el ID copiado a la factura (queda en la columna PDF_ID).
         const vinc = vincularPDFDrive(campos.fNumero, idCopia, nombreEst);
         if (!vinc.ok && vinc.error) {
           warning = 'Factura creada; PDF copiado pero no vinculado: ' + vinc.error;
@@ -3876,6 +3365,222 @@ function _finalizarProcesamientoPDF(item, campos, motorUsado, existentes, config
   return { estado: 'ok', detalle: '', warning: warningsFinales, numeroFactura: String(campos.fNumero || '').trim() };
 }
 
+/**
+ * Añade al registro _PDF_Procesados el motivo del último reemplazo
+ * de PDF asociado a una factura. Es acumulativo: si ya había
+ * anotaciones previas, se preservan.
+ */
+function _registrarMotivoReemplazoEnProcesados(numero, motivo) {
+  const num = String(numero || '').trim();
+  const mot = String(motivo || '').trim();
+  if (!num || !mot) return { actualizadas: 0 };
+  const reg = cargarRegistroPDFs();
+  const ahora = new Date().toISOString();
+  let actualizadas = 0;
+  Object.keys(reg).forEach(id => {
+    const e = reg[id];
+    if (!e) return;
+    const numEntrada = String(
+      e.numero || _extraerNumeroDePath(e.path) || ''
+    ).trim();
+    if (numEntrada !== num) return;
+    e.detalle = (e.detalle || '') +
+      '  ||  Reemplazo PDF: ' + mot + ' (' + ahora + ')';
+    if (!e.numero) e.numero = num;
+    actualizadas++;
+  });
+  if (actualizadas > 0) {
+    try { guardarRegistroPDFs(reg); }
+    catch (e) { Logger.log('[_registrarMotivoReemplazoEnProcesados] ' + e.message); }
+  }
+  return { actualizadas };
+}
+
+/**
+ * Aplica la regla de reemplazo de PDF por cantidad de páginas y
+ * distribuye el ganador en DriveOp + DriveCom del centro.
+ *
+ * Reglas (C1/C2 confirmadas):
+ *   · Nuevo > vigente  → el nuevo gana:
+ *       - si viene de "Sin asignar", se MUEVE (esa carpeta es de tránsito)
+ *       - se copia a DriveOp + DriveCom del centro
+ *       - se vincula el nuevo ID
+ *       - se elimina (papelera) el vigente de DriveOp, DriveCom y "Sin asignar"
+ *   · Nuevo ≤ vigente → el vigente gana:
+ *       - se elimina el nuevo (venga de donde venga)
+ *       - no se toca el vínculo
+ *   · Sin vigente, o mismo ID → sólo renombra y asegura distribución.
+ *
+ * Devuelve { ok, reemplazado, motivo, pdfId } o
+ *          { ok:false, conflicto:true, facturasEnConflicto:[...] }.
+ */
+function reemplazarYDistribuirPDF(numero, idOrigen, codigoCentro, nombreArchivo) {
+  const num = String(numero || '').trim();
+  const idNuevo = parseDriveId(idOrigen);
+  const cod = String(codigoCentro || '').trim();
+  if (!num)     return { ok: false, error: 'Falta N° factura' };
+  if (!idNuevo) return { ok: false, error: 'Falta ID del PDF' };
+
+  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
+  const data = sh.getDataRange().getValues();
+
+  // ─── 1) Localizar la fila de la factura y su PDF vigente ───
+  let fila = -1, idViejo = '';
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][COL.NUMERO - 1]).trim() === num) {
+      fila = i + 1;
+      idViejo = String(data[i][COL.PDF_ID - 1] || '').trim();
+      break;
+    }
+  }
+  if (fila === -1) return { ok: false, error: 'Factura no encontrada: ' + num };
+
+  // ─── 1.5) Conflicto: ¿el PDF nuevo ya está vinculado a otra factura? ───
+  const conflictos = [];
+  for (let i = 1; i < data.length; i++) {
+    const numFila = String(data[i][COL.NUMERO - 1] || '').trim();
+    const idFila  = String(data[i][COL.PDF_ID  - 1] || '').trim();
+    if (numFila !== num && idFila === idNuevo) {
+      conflictos.push({
+        numero:  numFila,
+        cliente: String(data[i][COL.CLIENTE - 1] || '').trim(),
+        periodo: String(data[i][COL.PERIODO - 1] || '').trim()
+      });
+    }
+  }
+  if (conflictos.length) {
+    return {
+      ok: false,
+      conflicto: true,
+      id: idNuevo,
+      numeroNuevo: num,
+      facturasEnConflicto: conflictos
+    };
+  }
+
+  // ─── Helpers locales ────────────────────────────────────────────
+  //  Distribuye un PDF al centro. Si viene de "Sin asignar", lo MUEVE
+  //  (esa carpeta es sólo de tránsito). Si no hay centro (cod=''),
+  //  sólo renombra y deja el archivo donde está.
+  const _distribuirAlCentro = (idFuente) => {
+    if (!cod) return idFuente;
+    try {
+      const cfg = leerConfig();
+      const fantasma = cfg.centros.find(c => _esCentroFantasmaBack(c.codigo, c.cliente));
+      const moverDesde = (fantasma && fantasma.driveOp && _esPDFEnCarpetaSinAsignar(idFuente))
+        ? fantasma.driveOp
+        : '';
+      const copia = copiarPDFDriveADestinos(idFuente, cod, nombreArchivo, moverDesde);
+      if (copia.ok && copia.archivos && copia.archivos.length) {
+        return copia.archivos[0].id;
+      }
+      Logger.log('[reemplazo] copiarADestinos sin archivo: ' + JSON.stringify(copia));
+    } catch (e) {
+      Logger.log('[reemplazo] _distribuirAlCentro error: ' + e.message);
+    }
+    return idFuente;
+  };
+
+  //  Elimina el PDF vigente de TODAS sus ubicaciones (Op/Com/Sin asignar)
+  //  porque ya existe una versión mejor.
+  const _limpiarViejo = (idViejoElim) => {
+    if (!idViejoElim) return;
+    if (_esPDFEnCarpetaSinAsignar(idViejoElim)) {
+      _eliminarPDFDeDrive(idViejoElim, 'carpeta "Sin asignar" es sólo de tránsito');
+    }
+    if (!cod) return;
+    try {
+      const cfg = leerConfig();
+      const centro = cfg.centros.find(c => String(c.codigo || '').trim() === cod);
+      if (!centro) return;
+      const fViejo = DriveApp.getFileById(idViejoElim);
+      const parents = fViejo.getParents();
+      let enOp = false, enCom = false;
+      while (parents.hasNext()) {
+        const pid = parents.next().getId();
+        if (centro.driveOp  && pid === centro.driveOp)  enOp  = true;
+        if (centro.driveCom && pid === centro.driveCom) enCom = true;
+      }
+      if (enOp || enCom) {
+        _eliminarPDFDeDrive(idViejoElim,
+          'reemplazado por versión con más páginas' +
+          (enOp ? ' [Op]' : '') + (enCom ? ' [Com]' : ''));
+      }
+    } catch (e) { Logger.log('[reemplazo] _limpiarViejo error: ' + e.message); }
+  };
+
+  // ─── 2) Sin vigente → distribuir + renombrar + vincular ───
+  if (!idViejo) {
+    const idFinal = _distribuirAlCentro(idNuevo);
+    try {
+      const f = DriveApp.getFileById(idFinal);
+      if (nombreArchivo) f.setName(String(nombreArchivo).trim());
+      const c = sh.getRange(fila, COL.PDF_ID);
+      c.setValue(idFinal); c.setNumberFormat('@');
+      const motivo = 'vinculado sin PDF previo';
+      try { _registrarMotivoReemplazoEnProcesados(num, motivo); } catch (e) { }
+      return { ok: true, reemplazado: true, motivo: motivo, pdfId: idFinal };
+    } catch (e) { return { ok: false, error: e.message }; }
+  }
+
+  // ─── 3) Mismo ID → asegurar distribución y renombrar ───
+  if (idViejo === idNuevo) {
+    const idFinal = _distribuirAlCentro(idNuevo);
+    try {
+      const f = DriveApp.getFileById(idFinal);
+      if (nombreArchivo) f.setName(String(nombreArchivo).trim());
+      if (idFinal !== idViejo) {
+        const c = sh.getRange(fila, COL.PDF_ID);
+        c.setValue(idFinal); c.setNumberFormat('@');
+      }
+      return { ok: true, reemplazado: false, motivo: 'mismo ID', pdfId: idFinal };
+    } catch (e) { return { ok: false, error: e.message }; }
+  }
+
+  // ─── 4) Comparar páginas ───
+  const pagViejo = _contarPaginasPdf(idViejo);
+  const pagNuevo = _contarPaginasPdf(idNuevo);
+  Logger.log('[reemplazo] ' + num + ' · vigente=' + pagViejo + 'p · nuevo=' + pagNuevo + 'p');
+
+  // ── Vigente gana (igual o más páginas): eliminar el nuevo ──
+  if (pagNuevo <= pagViejo) {
+    _eliminarPDFDeDrive(idNuevo,
+      'versión vigente tiene más o igual páginas (' + pagViejo + '≥' + pagNuevo + ')');
+    const motivo = 'vigente gana (' + pagViejo + 'p ≥ ' + pagNuevo + 'p) · nuevo eliminado';
+    try { _registrarMotivoReemplazoEnProcesados(num, motivo); } catch (e) { }
+    return {
+      ok: true, reemplazado: false,
+      motivo: 'vigente gana (' + pagViejo + 'p ≥ ' + pagNuevo + 'p)',
+      pdfId: idViejo
+    };
+  }
+
+  // ── Nuevo gana: distribuir, vincular y limpiar el vigente ──
+  const idCopia = _distribuirAlCentro(idNuevo);
+  try {
+    const f = DriveApp.getFileById(idCopia);
+    if (nombreArchivo) f.setName(String(nombreArchivo).trim());
+    const c = sh.getRange(fila, COL.PDF_ID);
+    c.setValue(idCopia); c.setNumberFormat('@');
+  } catch (e) {
+    return { ok: false, error: 'No se pudo vincular la copia: ' + e.message };
+  }
+
+  //  La carpeta "Sin asignar" es de paso: una vez promovido el PDF a
+  //  un centro real, se elimina la copia de tránsito y cualquier
+  //  versión anterior que siga en DriveOp o DriveCom.
+  _limpiarViejo(idViejo);
+
+  const motivo = 'nuevo gana (' + pagNuevo + 'p > ' + pagViejo + 'p) · vigente eliminado';
+  try { _registrarMotivoReemplazoEnProcesados(num, motivo); } catch (e) { }
+
+  return {
+    ok: true, reemplazado: true,
+    motivo: 'nuevo gana (' + pagNuevo + 'p > ' + pagViejo + 'p)',
+    pdfId: idCopia
+  };
+}
+
 function _listarPDFsRecursivo(folder, acc, path) {
   const pathActual = path ? path + '/' + folder.getName() : folder.getName();
   const files = folder.getFiles();
@@ -3889,9 +3594,47 @@ function _listarPDFsRecursivo(folder, acc, path) {
   while (subs.hasNext()) _listarPDFsRecursivo(subs.next(), acc, pathActual);
 }
 
-// ============================================================
-//  Cuenta páginas de un PDF
-// ============================================================
+/**
+ * Devuelve true si el archivo indicado está en el DriveOp del centro
+ * fantasma ("Sin asignar"). La carpeta de "Sin asignar" es SOLO de
+ * paso (transición): cuando un PDF llega a un centro real, la copia
+ * en esa carpeta deja de ser útil y debe eliminarse.
+ */
+function _esPDFEnCarpetaSinAsignar(fileId) {
+  if (!fileId) return false;
+  try {
+    const cfg = leerConfig();
+    const fantasma = cfg.centros.find(c => _esCentroFantasmaBack(c.codigo, c.cliente));
+    if (!fantasma || !fantasma.driveOp) return false;
+    const file = DriveApp.getFileById(fileId);
+    const parents = file.getParents();
+    while (parents.hasNext()) {
+      if (parents.next().getId() === fantasma.driveOp) return true;
+    }
+    return false;
+  } catch (e) {
+    Logger.log('[_esPDFEnCarpetaSinAsignar] ' + e.message);
+    return false;
+  }
+}
+
+/**
+ * Envía un archivo de Drive a la papelera (reversible).
+ * Se usa para limpieza tras un reemplazo de PDF.
+ */
+function _eliminarPDFDeDrive(fileId, motivo) {
+  if (!fileId) return { ok: false, error: 'ID vacío' };
+  try {
+    const file = DriveApp.getFileById(fileId);
+    file.setTrashed(true);
+    Logger.log('[limpieza] PDF ' + fileId + ' → papelera · motivo: ' + (motivo || 'sin especificar'));
+    return { ok: true };
+  } catch (e) {
+    Logger.log('[limpieza] No se pudo eliminar ' + fileId + ': ' + e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
 function _contarPaginasPdf(idOrFile) {
   try {
     const file = (typeof idOrFile === 'string') ? DriveApp.getFileById(idOrFile) : idOrFile;
@@ -3906,186 +3649,13 @@ function _contarPaginasPdf(idOrFile) {
   } catch (e) { Logger.log('_contarPaginasPdf error: ' + e.message); return 0; }
 }
 
-// ============================================================
-//  SETTERS genéricos
-// ============================================================
-function _setCeldaNum(sh, fila, col, val) {
-  if (val === undefined || val === null || val === '') return false;
-  const n = Number(val);
-  if (!isFinite(n) || n <= 0) return false;
-  sh.getRange(fila, col).setValue(n);
-  return true;
-}
-function _setCeldaFecha(sh, fila, col, iso) {
-  if (!iso) return false;
-  const s = String(iso).trim();
-  const c = sh.getRange(fila, col);
-  if (SENTINELAS.indexOf(s) !== -1) {
-    c.setNumberFormat('@');
-    c.setValue(s);
-    return true;
-  }
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
-  const p = s.split('-').map(Number);
-  c.setNumberFormat('dd/mm/yyyy');
-  c.setValue(new Date(p[0], p[1] - 1, p[2]));
-  return true;
-}
-function _setCeldaTexto(sh, fila, col, val) {
-  if (val === undefined || val === null) return false;
-  const s = String(val).trim();
-  if (!s) return false;
-  sh.getRange(fila, col).setValue(s).setNumberFormat('@');
-  return true;
-}
+
 
 // ============================================================
-//  MIGRACIÓN — eliminar físicamente la columna "Empalme"
-//  Ejecutar UNA VEZ desde el menú ⚡ Funciones adicionales.
-//  Después de correrla, la columna C (Empalme) desaparece y las
-//  columnas a la derecha se recorren automáticamente.
+//  MIGRACIONES
 // ============================================================
 
 
-/**
- * Convierte a Date las fechas que estén guardadas como texto en
- * la hoja "Resumen Facturación" (F.Recep Consumo, F.Recep Peaje,
- * F.Emisión, F.Venc). Ejecutar UNA VEZ.
- */
-function convertirFechasTextoADate() {
-  const ui = SpreadsheetApp.getUi();
-  const sh = SpreadsheetApp.openById(SS_ID).getSheetByName(HOJA_RESUMEN);
-  if (!sh) { ui.alert('No existe la hoja ' + HOJA_RESUMEN); return; }
-  const lr = sh.getLastRow();
-  if (lr < 2) { ui.alert('Sin datos.'); return; }
-
-  const cols = [COL.FECHA_SUMINISTRO, COL.FECHA_PEAJE, COL.FECHA_EMISION, COL.FECHA_VENC];
-  let convertidas = 0;
-
-  cols.forEach(col => {
-    const rango = sh.getRange(2, col, lr - 1, 1);
-    const vals = rango.getValues();
-    let cambio = false;
-    const nuevos = vals.map(r => {
-      const v = r[0];
-      if (v instanceof Date) return [v];
-      if (v === null || v === undefined || v === '') return [v];
-      const s = String(v).trim();
-      if (SENTINELAS.indexOf(s) !== -1) return [v];
-      let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
-      if (m) { cambio = true; convertidas++; return [new Date(+m[1], +m[2]-1, +m[3])]; }
-      m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-      if (m) { cambio = true; convertidas++; return [new Date(+m[3], +m[2]-1, +m[1])]; }
-      return [v];
-    });
-    if (cambio) {
-      rango.setNumberFormat('dd/mm/yyyy');
-      rango.setValues(nuevos);
-    }
-  });
-
-  Logger.log('✓ Fechas convertidas a Date: ' + convertidas);
-  ui.alert('✓ Conversión completada.\n\nFechas convertidas: ' + convertidas);
-}
-
-/**
- * Consolida en UNA sola fila el centro "Sin asignar":
- *   · Renombra todas las facturas del Resumen que apunten a
- *     variantes previas (TEMP, ⚠️ Sin asignar) al nuevo formato
- *     "Sin asignar" / "Sin código".
- *   · Deja en Config una única fila fantasma.
- *
- * Ejecutar UNA VEZ desde el menú ⚡ Funciones adicionales.
- */
-function consolidarCentroSinAsignar() {
-  const ui = SpreadsheetApp.getUi();
-  const ok = ui.alert(
-    '🧹 Consolidar centro "Sin asignar"',
-    'Se unificarán las variantes TEMP / ⚠️ Sin asignar en una sola:\n\n' +
-    '  Centro: "Sin asignar"  ·  Código: "Sin código"\n\n' +
-    'Se actualizarán las facturas del Resumen y la hoja Config.\n\n¿Continuar?',
-    ui.ButtonSet.YES_NO
-  );
-  if (ok !== ui.Button.YES) return;
-
-  const CODIGO_NUEVO  = 'Sin código';
-  const CLIENTE_NUEVO = 'Sin asignar';
-  const ss = SpreadsheetApp.openById(SS_ID);
-  const shResumen = ss.getSheetByName(HOJA_RESUMEN);
-  const shConfig  = ss.getSheetByName(HOJA_CONFIG);
-
-  let facturasActualizadas = 0;
-  let filasConfigBorradas  = 0;
-
-  // 1) Normalizar facturas
-  if (shResumen) {
-    const lr = shResumen.getLastRow();
-    if (lr >= 2) {
-      const data = shResumen.getRange(2, 1, lr - 1, COL.CLIENTE).getValues();
-      for (let i = 0; i < data.length; i++) {
-        const cliente = String(data[i][COL.CLIENTE - 1] || '').trim();
-        const codigo  = String(data[i][COL.CODIGO  - 1] || '').trim();
-        if (!_esCentroFantasmaBack(codigo, cliente)) continue;
-        let cambio = false;
-        if (cliente !== CLIENTE_NUEVO) {
-          shResumen.getRange(i + 2, COL.CLIENTE).setValue(CLIENTE_NUEVO);
-          cambio = true;
-        }
-        if (codigo !== CODIGO_NUEVO) {
-          shResumen.getRange(i + 2, COL.CODIGO).setValue(CODIGO_NUEVO).setNumberFormat('@');
-          cambio = true;
-        }
-        if (cambio) facturasActualizadas++;
-      }
-    }
-  }
-
-  // 2) Normalizar Config (dejar sólo una fila fantasma)
-  if (shConfig) {
-    const lrC = Math.max(shConfig.getLastRow(), 1);
-    const filasGhost = [];
-    if (lrC >= 2) {
-      const vals = shConfig.getRange(2, 2, lrC - 1, 9).getValues();
-      for (let i = 0; i < vals.length; i++) {
-        const codigo  = String(vals[i][1] || '').trim();
-        const cliente = String(vals[i][2] || '').trim();
-        if (_esCentroFantasmaBack(codigo, cliente)) filasGhost.push(i + 2);
-      }
-    }
-    filasGhost.sort((a, b) => b - a).forEach(fila => {
-      shConfig.deleteRow(fila);
-      filasConfigBorradas++;
-    });
-    _asegurarColumnaEmpresa(shConfig);
-    const nextRow = Math.max(shConfig.getLastRow(), 1) + 1;
-    shConfig.getRange(nextRow, 2, 1, 9).setValues([[
-      '', CODIGO_NUEVO, CLIENTE_NUEVO, '', '', '', '', '', 'EMOAC'
-    ]]);
-    _configCache = null;
-  }
-
-  refrescarSeguimiento();
-  ui.alert(
-    '✓ Consolidación completada.\n\n' +
-    '· Facturas actualizadas: ' + facturasActualizadas + '\n' +
-    '· Filas Config borradas: ' + filasConfigBorradas + '\n\n' +
-    'Se dejó una única fila "Sin asignar" / "Sin código".'
-  );
-}
-// ============================================================
-//  NOMBRE ESTÁNDAR DE PDF — FUENTE ÚNICA DE VERDAD
-//  Formato: Periodo_Código_N°Factura_CentroDeCosto_Tipo.pdf
-//
-//  Acepta un objeto con cualquiera de estas claves (prioriza las
-//  que vienen del parser, con fallback a las del modal):
-//    · numero / fNumero
-//    · codigo / fCodigo
-//    · periodo / fPeriodo
-//    · tipo / fTipo
-//
-//  El nombre del centro se resuelve por código desde `leerConfig()`,
-//  así no depende del DOM ni del option seleccionado.
-// ============================================================
 function _construirNombreArchivoEstandar(datos, centro) {
   const d = datos || {};
 
@@ -4100,8 +3670,6 @@ function _construirNombreArchivoEstandar(datos, centro) {
   else if (tipoRaw === 'UNIFICADA')   etiquetaTipo = 'Unificada';
   else if (tipoRaw === 'ARRIENDO_MEDIDOR') etiquetaTipo = 'ArriendoMedidor';
 
-  // El centro puede venir por parámetro (evita lookup) o resolverse
-  // por código contra Config.
   let centroNombre = '';
   if (centro && String(centro.codigo || '').trim() === codigo) {
     centroNombre = String(centro.cliente || '').trim();
@@ -4109,8 +3677,6 @@ function _construirNombreArchivoEstandar(datos, centro) {
     const cfg = leerConfig();
     const c = cfg.centros.find(x => String(x.codigo || '').trim() === codigo);
     if (c) centroNombre = String(c.cliente || '').trim();
-    // Si no se encontró con el cache actual, forzar relectura y
-    // reintentar antes de caer a "sin-centro".
     if (!centroNombre) {
       _invalidarConfigCache();
       const cfg2 = leerConfig();
@@ -4128,351 +3694,452 @@ function _construirNombreArchivoEstandar(datos, centro) {
   return periodo + '_' + codigoSafe + '_' + numero + '_' + centroSafe + '_' + tipoSafe + '.pdf';
 }
 
+// ============================================================
+//  PROCESADOR HORARIO · CARPETA DE TRANSICIÓN
+// ============================================================
+const HANDLER_TRANSICION = 'procesarCarpetaTransicionTrigger';
+const CORREO_TRANSICION = 'rnavarro@usurbanrealty.com';
+const TIEMPO_MAX_TRANSICION_MS = 4 * 60 * 1000;
 
-/**
- * Migra la base de datos y las hojas del libro desde la
- * nomenclatura antigua "Consumo" a "Suministro":
- *   · Renombra la hoja "Consumo" → "Suministro".
- *   · Cambia el valor tipo='CONSUMO' → 'SUMINISTRO' en el Resumen.
- *
- * Ejecutar UNA VEZ desde ⚡ Funciones adicionales.
- */
-function migrarConsumoASuministro() {
-  const ui = SpreadsheetApp.getUi();
-  const ok = ui.alert(
-    '🔁 Migrar "Consumo" → "Suministro"',
-    'Este proceso:\n\n' +
-    '  1. Renombra la hoja "Consumo" → "Suministro".\n' +
-    '  2. Cambia el valor de la columna Tipo de "CONSUMO" a "SUMINISTRO"\n' +
-    '     en todas las filas del Resumen.\n\n' +
-    'Es idempotente (se puede correr varias veces sin daño).\n\n¿Continuar?',
-    ui.ButtonSet.YES_NO
-  );
-  if (ok !== ui.Button.YES) return;
 
-  const ss = SpreadsheetApp.openById(SS_ID);
-
-  // ─── 1) Renombrar la hoja Consumo → Suministro ───
-  let hojaRenombrada = false;
-  const shViejo = ss.getSheetByName('Consumo');
-  const shNuevo = ss.getSheetByName('Suministro');
-  if (shViejo && !shNuevo) {
-    shViejo.setName('Suministro');
-    hojaRenombrada = true;
+function procesarCarpetaTransicionTrigger() {
+  try {
+    const r = procesarCarpetaTransicion({ silencioso: true });
+    Logger.log('[Trigger transición] ' + JSON.stringify({
+      ok: r.ok, procesados: r.procesados, okNuevas: r.okNuevas,
+      sinCentro: r.sinCentro, rectificadas: r.rectificadas,
+      duplicadas: r.duplicadas, revManual: r.revManual,
+      revisionManual: r.revisionManual, errores: r.errores,
+      tiempoAgotado: r.tiempoAgotado, restantes: r.restantes
+    }));
+  } catch (e) {
+    Logger.log('[Trigger transición] Error: ' + e.message + '\n' + (e.stack || ''));
   }
-
-  // ─── 2) Migrar el valor tipo='CONSUMO' → 'SUMINISTRO' ───
-  let filasMigradas = 0;
-  const sh = ss.getSheetByName(HOJA_RESUMEN);
-  if (sh) {
-    const lr = sh.getLastRow();
-    if (lr >= 2) {
-      const rango = sh.getRange(2, COL.TIPO, lr - 1, 1);
-      const vals = rango.getValues();
-      let cambio = false;
-      const nuevos = vals.map(r => {
-        if (String(r[0] || '').trim().toUpperCase() === 'CONSUMO') {
-          cambio = true; filasMigradas++;
-          return ['SUMINISTRO'];
-        }
-        return [r[0]];
-      });
-      if (cambio) rango.setValues(nuevos);
-    }
-  }
-
-  refrescarSeguimiento();
-  ui.alert(
-    '✓ Migración completada.\n\n' +
-    '· Hoja renombrada: ' + (hojaRenombrada ? 'sí (Consumo → Suministro)' : 'no (ya estaba o no existía)') + '\n' +
-    '· Facturas migradas a "SUMINISTRO": ' + filasMigradas
-  );
 }
 
-// ============================================================
-//  RENOMBRADO MASIVO DE PDFs VINCULADOS
-//  (usa `_construirNombreArchivoEstandar` definido justo arriba —
-//   fuente única de verdad del nombre estándar)
-// ============================================================
 
-/**
- * Recorre todas las filas con PDF_ID y renombra los archivos en Drive
- * al formato estándar.
- *
- *   · Si el archivo ya tiene el nombre correcto → no se toca.
- *   · Si el ID está en papelera o es inaccesible → busca en los Drives
- *     del centro un archivo cuyo nombre contenga el N° de factura y
- *     reemplaza el ID en la BD con el encontrado.
- *   · Si la auto-búsqueda falla → pide el ID manualmente por `ui.prompt`.
- *
- * Invocable desde el menú ⚡ Funciones adicionales.
- */
-function renombrarTodosLosPDFs() {
-  const ui = SpreadsheetApp.getUi();
 
-  const confirmar = ui.alert(
-    '📝 Renombrar PDFs vinculados',
-    'Se recorrerán TODAS las filas con PDF_ID en "Resumen Facturación"\n' +
-    'y se renombrará cada archivo en Drive al formato:\n\n' +
-    '  Periodo_Código_N°Factura_CentroDeCosto_Tipo.pdf\n\n' +
-    'Comportamiento:\n' +
-    '  · Si el archivo ya tiene el nombre correcto → no se toca.\n' +
-    '  · Si el ID está en papelera o es inaccesible, se busca\n' +
-    '    automáticamente en los Drives del centro un archivo cuyo nombre\n' +
-    '    contenga el N° de factura y se usa ese ID.\n' +
-    '  · Si la auto-búsqueda no encuentra nada, se pide el ID manualmente.\n\n' +
-    '¿Continuar?',
-    ui.ButtonSet.YES_NO
-  );
-  if (confirmar !== ui.Button.YES) return;
-
-  const ss = SpreadsheetApp.openById(SS_ID);
-  const sh = ss.getSheetByName(HOJA_RESUMEN);
-  if (!sh) { ui.alert('No existe la hoja "Resumen Facturación".'); return; }
-
-  const lr = Math.max(sh.getLastRow(), 1);
-  if (lr < 2) { ui.alert('No hay facturas.'); return; }
-
-  const nCols = Math.max(sh.getLastColumn(), COL.PDF_ID);
-  const data  = sh.getRange(2, 1, lr - 1, nCols).getValues();
-
-  let renombrados     = 0;
-  let sinCambio       = 0;
-  let sinPDF          = 0;
-  let autoRecuperados = 0;
-  let reemplazados    = 0;
-  let pospuestos      = 0;
-  const problemas     = [];   // filas sin resolver (se preguntan después)
-  const errores       = [];   // errores inesperados
-
-  for (let i = 0; i < data.length; i++) {
-    const fila    = data[i];
-    const numero  = String(fila[COL.NUMERO - 1] || '').trim();
-    const codigo  = String(fila[COL.CODIGO - 1] || '').trim();
-    const periodo = String(fila[COL.PERIODO - 1] || '').trim();
-    const tipo    = String(fila[COL.TIPO - 1] || '').trim();
-    const pdfId   = String(fila[COL.PDF_ID - 1] || '').trim();
-
-    if (!pdfId) { sinPDF++; continue; }
-    if (!numero) { sinPDF++; continue; }
-
-    const nombreNuevo = _construirNombreArchivoEstandar({ numero, codigo, periodo, tipo });
-
-    // ─── 1) Intentar acceder al archivo actual ───
-    let file = null;
-    let motivoProblema = '';
-    try {
-      file = DriveApp.getFileById(pdfId);
-      let trashed = false;
-      try { trashed = file.isTrashed(); } catch (e) {}
-      if (trashed) { file = null; motivoProblema = 'En papelera'; }
-    } catch (e) {
-      file = null;
-      motivoProblema = 'Inaccesible: ' + (e.message || e);
+function _limpiarTriggersTransicion() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === HANDLER_TRANSICION) {
+      try { ScriptApp.deleteTrigger(t); } catch (e) { }
     }
+  });
+}
 
-    // ─── 2) Auto-búsqueda en el Drive del centro ───
-    if (!file) {
-      const busqueda = _buscarPDFEnDriveDelCentro(codigo, numero);
-      if (busqueda.ok && busqueda.encontrado) {
-        const rRep = reemplazarPDFFactura(numero, busqueda.id);
-        if (rRep.ok) {
-          autoRecuperados++;
-          try { file = DriveApp.getFileById(busqueda.id); } catch (e) { file = null; }
-          Logger.log('[auto-recuperado] N° ' + numero + '  →  ' + busqueda.id +
-                     '  (' + busqueda.carpeta + ': ' + busqueda.nombre + ')');
-        } else {
-          motivoProblema += ' · No se pudo guardar el ID nuevo: ' + rRep.error;
-        }
-      } else {
-        motivoProblema += ' · Auto-búsqueda: ' + (busqueda.error || 'sin resultado');
-      }
+function procesarCarpetaTransicion(opciones) {
+  opciones = opciones || {};
+  const cfg = leerConfig();
+  const fantasma = cfg.centros.find(c => _esCentroFantasmaBack(c.codigo, c.cliente));
+  if (!fantasma) return { ok: false, error: 'No hay centro "Sin asignar" en Config' };
+  if (!fantasma.driveOp) return { ok: false, error: 'El centro "Sin asignar" no tiene DriveOp configurado en Config' };
+
+  const carpetaId = String(fantasma.driveOp).trim();
+  let folder;
+  try { folder = DriveApp.getFolderById(carpetaId); }
+  catch (e) { return { ok: false, error: 'No se pudo acceder a la carpeta de transición: ' + e.message }; }
+
+  const archivos = [];
+  const it = folder.getFiles();
+  while (it.hasNext()) {
+    const f = it.next();
+    if (!/\.pdf$/i.test(f.getName())) continue;
+    archivos.push(f);
+  }
+
+  if (!archivos.length) {
+    return {
+      ok: true, sinActividad: true,
+      total: 0, procesados: 0, saltados: 0,
+      okNuevas: 0, sinCentro: 0, rectificadas: 0, duplicadas: 0,
+      revManual: 0, revisionManual: 0, errores: 0,
+      detalleOk: [], detalleFallidos: [], detalleRectificadas: [],
+      tiempoAgotado: false, restantes: 0
+    };
+  }
+
+  archivos.sort((a, b) => {
+    let da = 0, db = 0;
+    try { da = a.getDateCreated().getTime(); } catch (e) { }
+    try { db = b.getDateCreated().getTime(); } catch (e) { }
+    return da - db;
+  });
+
+  const reg = cargarRegistroPDFs();
+  const existentes = leerResumen();
+  const resultado = {
+    ok: true, sinActividad: false,
+    total: archivos.length, procesados: 0, saltados: 0,
+    okNuevas: 0, sinCentro: 0, rectificadas: 0, duplicadas: 0,
+    revManual: 0, revisionManual: 0, errores: 0,
+    detalleOk: [], detalleFallidos: [], detalleRectificadas: [],
+    tiempoAgotado: false, restantes: 0
+  };
+
+  const inicio = Date.now();
+  for (let i = 0; i < archivos.length; i++) {
+    if (Date.now() - inicio > TIEMPO_MAX_TRANSICION_MS) {
+      resultado.tiempoAgotado = true;
+      resultado.restantes = archivos.length - i;
+      break;
     }
+    const file = archivos[i];
+    let fileId = '';
+    try { fileId = file.getId(); } catch (e) { }
+    if (!fileId) continue;
 
-    // ─── 3) Si sigue sin archivo, registrar para preguntar después ───
-    if (!file) {
-      problemas.push({
-        fila: i + 2, numero, codigo, pdfId, nombreNuevo,
-        motivo: motivoProblema || 'No se pudo acceder al archivo'
-      });
+    const prev = reg[fileId];
+    if (prev && ['ok', 'rectificada', 'sin_centro', 'duplicada', 'revision_manual'].indexOf(prev.estado) !== -1) {
+      resultado.saltados++;
       continue;
     }
 
-    // ─── 4) Renombrar si corresponde ───
+    let fechaCreacion = '';
     try {
-      const nombreActual = file.getName();
-      if (nombreActual === nombreNuevo) { sinCambio++; continue; }
-      file.setName(nombreNuevo);
-      renombrados++;
-    } catch (e) {
-      problemas.push({
-        fila: i + 2, numero, codigo, pdfId, nombreNuevo,
-        motivo: 'Renombrado falló: ' + (e.message || e)
-      });
-    }
-  }
+      const d = file.getDateCreated();
+      fechaCreacion = Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    } catch (e) { }
 
-  // ─── 5) Pregunta manual sólo para lo que quedó sin resolver ───
-  if (problemas.length) {
-    const quiereManual = ui.alert(
-      '⚠️ ' + problemas.length + ' PDFs requieren atención',
-      'La auto-búsqueda en el Drive del centro no encontró el archivo para:\n\n' +
-      problemas.slice(0, 10).map(p =>
-        '· Fila ' + p.fila + '  N° ' + p.numero + '  —  ' + p.motivo
-      ).join('\n') +
-      (problemas.length > 10 ? '\n  … y ' + (problemas.length - 10) + ' más' : '') +
-      '\n\n¿Querés ingresar manualmente un ID/URL por cada uno?',
-      ui.ButtonSet.YES_NO
-    );
+    const r = _procesarUnPDFTransicion(file, fechaCreacion, existentes, cfg, fantasma);
 
-    if (quiereManual === ui.Button.YES) {
-      problemas.forEach(p => {
-        const resp = ui.prompt(
-          'Reemplazar PDF · Fila ' + p.fila + '  N° ' + p.numero,
-          p.motivo + '\n\n' +
-          'Nombre esperado:\n  ' + p.nombreNuevo + '\n\n' +
-          'ID actual en la BD:\n  ' + p.pdfId + '\n\n' +
-          'Pegá el ID o URL del archivo nuevo (dejá vacío para saltar):',
-          ui.ButtonSet.OK_CANCEL
-        );
-        if (resp.getSelectedButton() !== ui.Button.OK) { pospuestos++; return; }
-        const nuevoId = String(resp.getResponseText() || '').trim();
-        if (!nuevoId) { pospuestos++; return; }
+    let nombreArchivo = '';
+    try { nombreArchivo = file.getName(); } catch (e) { }
+    reg[fileId] = {
+      path: '(transición)/' + nombreArchivo,
+      estado: r.estado,
+      detalle: (r.detalle || '').slice(0, 4500),
+      ts: new Date().toISOString(),
+      numero: r.numeroFactura || ''
+    };
 
-        const r = reemplazarPDFFactura(p.numero, nuevoId);
-        if (r.ok) {
-          reemplazados++;
-          try {
-            const f2 = DriveApp.getFileById(r.id);
-            if (f2.getName() !== p.nombreNuevo) {
-              f2.setName(p.nombreNuevo);
-              renombrados++;
-            }
-          } catch (e) { /* se resolverá en la próxima corrida */ }
-        } else {
-          errores.push({ fila: p.fila, numero: p.numero, error: r.error });
-        }
-      });
+    resultado.procesados++;
+    if (r.estado === 'ok') {
+      resultado.okNuevas++;
+      resultado.detalleOk.push({ archivo: nombreArchivo, numero: r.numeroFactura, centro: r.centro, warnings: r.warnings });
+    } else if (r.estado === 'sin_centro') {
+      resultado.sinCentro++;
+      resultado.detalleOk.push({ archivo: nombreArchivo, numero: r.numeroFactura, centro: 'Sin asignar', warnings: r.warnings });
+    } else if (r.estado === 'rectificada') {
+      resultado.rectificadas++;
+      resultado.detalleRectificadas.push({ archivo: nombreArchivo, numero: r.numeroFactura, warnings: r.warnings });
+    } else if (r.estado === 'rev_manual') {
+      resultado.revManual++;
+      resultado.detalleRectificadas.push({ archivo: nombreArchivo, numero: r.numeroFactura, diffs: r.detalle, warnings: r.warnings });
+    } else if (r.estado === 'duplicada') {
+      resultado.duplicadas++;
+    } else if (r.estado === 'revision_manual') {
+      resultado.revisionManual++;
+      resultado.detalleFallidos.push({ archivo: nombreArchivo, motivo: r.detalle || 'Sin datos mínimos' });
     } else {
-      pospuestos = problemas.length;
+      resultado.errores++;
+      resultado.detalleFallidos.push({ archivo: nombreArchivo, motivo: r.detalle || r.estado });
     }
+
+    if (r.nuevaFactura) existentes.push(r.nuevaFactura);
+
+    try { guardarRegistroPDFs(reg); } catch (e) { }
   }
 
-  // ─── 6) Resumen final ───
-  const lineas = [];
-  lineas.push('📝 Renombrado de PDFs');
-  lineas.push('');
-  lineas.push('Filas procesadas:      ' + data.length);
-  lineas.push('Renombrados:           ' + renombrados);
-  lineas.push('Sin cambio (ya OK):    ' + sinCambio);
-  lineas.push('Auto-recuperados:      ' + autoRecuperados);
-  lineas.push('Reemplazados manual:   ' + reemplazados);
-  lineas.push('Pospuestos:            ' + pospuestos);
-  lineas.push('Sin PDF vinculado:     ' + sinPDF);
-  lineas.push('Errores:               ' + errores.length);
+  try { guardarRegistroPDFs(reg); } catch (e) { }
+  try { refrescarSeguimiento(); } catch (e) { }
 
-  if (problemas.length && pospuestos) {
-    lineas.push('');
-    lineas.push('PDFs sin resolver:');
-    problemas.slice(0, 20).forEach(p => {
-      lineas.push('  · Fila ' + p.fila + ' · N° ' + p.numero + '  — ' + p.motivo);
-    });
-    Logger.log(JSON.stringify(problemas, null, 2));
+  if (resultado.procesados > 0) {
+    try { _enviarCorreoTransicion(resultado); }
+    catch (e) { Logger.log('Correo transición falló: ' + e.message); }
   }
 
-  if (errores.length) {
-    lineas.push('');
-    lineas.push('Errores inesperados:');
-    errores.slice(0, 20).forEach(e => {
-      lineas.push('  · Fila ' + e.fila + ' · N° ' + e.numero + '\n      ' + e.error);
-    });
-    Logger.log(JSON.stringify(errores, null, 2));
-  }
+  Logger.log(JSON.stringify({
+    total: resultado.total, procesados: resultado.procesados,
+    saltados: resultado.saltados, ok: resultado.okNuevas,
+    sinCentro: resultado.sinCentro, rectificadas: resultado.rectificadas,
+    duplicadas: resultado.duplicadas, revManual: resultado.revManual,
+    revisionManual: resultado.revisionManual, errores: resultado.errores,
+    tiempoAgotado: resultado.tiempoAgotado, restantes: resultado.restantes
+  }, null, 2));
 
-  Logger.log(lineas.join('\n'));
-  ui.alert(lineas.join('\n'));
+  return resultado;
 }
 
-/**
- * Sólo muestra en el log qué renombraría, sin tocar nada.
- * Útil para revisar antes de correr la función real.
- */
-function previsualizarRenombradoPDFs() {
-  const ss = SpreadsheetApp.openById(SS_ID);
-  const sh = ss.getSheetByName(HOJA_RESUMEN);
-  if (!sh) { Logger.log('No existe "Resumen Facturación"'); return; }
+function _procesarUnPDFTransicion(file, fechaCreacion, existentes, cfg, fantasma) {
+  let base64, mime;
+  try {
+    const blob = file.getBlob();
+    base64 = Utilities.base64Encode(blob.getBytes());
+    mime = blob.getContentType() || 'application/pdf';
+  } catch (e) {
+    return { estado: 'error_ocr', detalle: 'Lectura falló: ' + e.message };
+  }
 
-  const lr = Math.max(sh.getLastRow(), 1);
-  if (lr < 2) { Logger.log('Sin facturas'); return; }
+  const c = _cascadaOCRTransicion(base64, mime, file.getName());
+  if (!c.ok || !c.campos) {
+    return { estado: 'error_ocr', detalle: c.error || 'Ninguna fuente pudo extraer campos' };
+  }
+  const campos = c.campos;
+  const motorUsado = c.fuente || '?';
 
-  const nCols = Math.max(sh.getLastColumn(), COL.PDF_ID);
-  const data  = sh.getRange(2, 1, lr - 1, nCols).getValues();
+  const tieneNumero = !!(campos.fNumero && String(campos.fNumero).trim());
+  const tienePeriodo = !!(campos.fPeriodo && String(campos.fPeriodo).trim());
+  if (!tieneNumero || !tienePeriodo) {
+    _renombrarConPrefijo(file, '[REVISIÓN MANUAL]');
+    const falta = [];
+    if (!tieneNumero) falta.push('N° factura');
+    if (!tienePeriodo) falta.push('período');
+    return {
+      estado: 'revision_manual',
+      detalle: 'Faltan datos mínimos: ' + falta.join(', ') + ' · Motor: ' + motorUsado,
+      numeroFactura: campos.fNumero || ''
+    };
+  }
 
-  const lineas = [];
-  let conCambio     = 0;
-  let papelera      = 0;
-  let inaccesibles  = 0;
-  let recuperables  = 0;
+  const _normCod = (s) => String(s || '').trim().replace(/[\.\s\-]/g, '').toUpperCase();
+  const codBuscado = _normCod(campos.fCodigo);
+  const centroReal = codBuscado
+    ? cfg.centros.find(x => _normCod(x.codigo) === codBuscado && !_esCentroFantasmaBack(x.codigo, x.cliente))
+    : null;
+  const esReal = !!centroReal;
+  const centroFinal = centroReal || fantasma;
 
-  data.forEach((fila, i) => {
-    const numero  = String(fila[COL.NUMERO - 1] || '').trim();
-    const codigo  = String(fila[COL.CODIGO - 1] || '').trim();
-    const periodo = String(fila[COL.PERIODO - 1] || '').trim();
-    const tipo    = String(fila[COL.TIPO - 1] || '').trim();
-    const pdfId   = String(fila[COL.PDF_ID - 1] || '').trim();
-    if (!pdfId || !numero) return;
+  const tipo = (campos.fTipo || 'SUMINISTRO').toUpperCase();
+  const numFactura = String(campos.fNumero).trim();
+  const dup = existentes.find(f => String(f.numero).trim() === numFactura);
 
-    const nombreNuevo = _construirNombreArchivoEstandar({ numero, codigo, periodo, tipo });
-    let file = null, motivo = '';
+  let warning = '';
+
+  if (dup) {
+    // ─── Reemplazo inteligente por cantidad de páginas ─────────────
+    //  · Si el archivo está en "Sin asignar", reemplazarYDistribuirPDF
+    //    lo MUEVE al centro real cuando corresponde.
+    //  · Si el vigente gana (mismo o más páginas), el nuevo (que está
+    //    en "Sin asignar") se elimina.
+    //  · Si el nuevo gana, se limpia el vigente de DriveOp/DriveCom.
+    const nombreEst = _construirNombreArchivoEstandar(campos, centroFinal);
+    let rReemplazo;
     try {
-      file = DriveApp.getFileById(pdfId);
-      let trashed = false;
-      try { trashed = file.isTrashed(); } catch (e) {}
-      if (trashed) { file = null; motivo = 'EN PAPELERA'; }
+      rReemplazo = reemplazarYDistribuirPDF(
+        numFactura,
+        file.getId(),
+        esReal ? centroFinal.codigo : '',
+        nombreEst
+      );
     } catch (e) {
-      file = null;
-      motivo = 'INACCESIBLE: ' + (e.message || e);
+      return { estado: 'error_otro', detalle: 'Reemplazo PDF: ' + e.message, numeroFactura: numFactura };
+    }
+    if (rReemplazo.conflicto) {
+      const nums = (rReemplazo.facturasEnConflicto || []).map(x => x.numero).join(', ');
+      return { estado: 'error_otro', detalle: 'Reemplazo PDF: conflicto con factura(s) ' + (nums || 'desconocida'), numeroFactura: numFactura };
+    }
+    if (!rReemplazo.ok) {
+      return { estado: 'error_otro', detalle: 'Reemplazo PDF: ' + (rReemplazo.error || 'error desconocido'), numeroFactura: numFactura };
     }
 
-    // Simular auto-búsqueda
-    if (!file) {
-      const busqueda = _buscarPDFEnDriveDelCentro(codigo, numero);
-      if (busqueda.ok && busqueda.encontrado) {
-        recuperables++;
-        lineas.push('· Fila ' + (i + 2) + '  N° ' + numero + '  ⚠️ ' + motivo +
-                    '  →  auto-recuperable');
-        lineas.push('    id actual:     ' + pdfId);
-        lineas.push('    id encontrado: ' + busqueda.id + '  (' + busqueda.carpeta + ')');
-        lineas.push('    nombre encontrado: ' + busqueda.nombre);
-        lineas.push('    nombre esperado:   ' + nombreNuevo);
-        return;
+    if (!rReemplazo.reemplazado) {
+      const _det = 'Duplicado sin mejora · ' + (rReemplazo.motivo || '');
+      try { _registrarMotivoReemplazoEnProcesados(numFactura, _det); } catch (e) { }
+      return {
+        estado: 'duplicada',
+        detalle: _det,
+        numeroFactura: numFactura
+      };
+    }
+
+    const idDriveNuevo = rReemplazo.pdfId || '';
+
+    let rAct;
+    try {
+      rAct = actualizarFacturaDesdePDF({
+        numero: numFactura, tipo: tipo,
+        cliente: centroFinal.cliente, codigo: centroFinal.codigo,
+        periodo: campos.fPeriodo,
+        kwh: campos.fKwh, sum: campos.fSum, peaje: campos.fPeaje,
+        intereses: campos.fInt, intPeaje: campos.fIntPeaje,
+        total: campos.fTotal,
+        fechaEmision: campos.fEmision, fechaVencimiento: campos.fVencimiento,
+        fechaConsumo: '', fechaPeaje: ''
+      }, idDriveNuevo, new Date());
+    } catch (e) {
+      return { estado: 'error_otro', detalle: 'Rectificar: ' + e.message, numeroFactura: numFactura };
+    }
+    if (!rAct.ok) return { estado: 'error_otro', detalle: 'Rectificar: ' + rAct.error, numeroFactura: numFactura };
+
+    const diffs = _diffFacturaPDF(dup, campos);
+    //  Motivo del reemplazo en `detalle` para que viaje al correo y
+    //  al log del lote de transición.
+    const _detReemplazo = '[PDF] ' + (rReemplazo.motivo || '');
+
+    if (diffs.length) {
+      return {
+        estado: 'rev_manual',
+        detalle: _detReemplazo + '\nDiferencias:\n' + diffs.join('\n'),
+        numeroFactura: numFactura, centro: centroFinal.cliente, warnings: warning
+      };
+    }
+    return {
+      estado: 'rectificada',
+      detalle: _detReemplazo,
+      numeroFactura: numFactura, centro: centroFinal.cliente, warnings: warning
+    };
+  }
+
+  const fechaRecep = fechaCreacion || '';
+  const aplicaConsumo = (tipo === 'SUMINISTRO' || tipo === 'UNIFICADA');
+  const aplicaPeaje = (tipo === 'PEAJE' || tipo === 'UNIFICADA' || tipo === 'ARRIENDO_MEDIDOR');
+
+  let idDriveFinal = '';
+  if (esReal && (centroReal.driveOp || centroReal.driveCom)) {
+    const nombreEst = _construirNombreArchivoEstandar(campos, centroReal);
+    const rMv = copiarPDFDriveADestinos(file.getId(), centroReal.codigo, nombreEst, fantasma.driveOp);
+    if (rMv.ok && rMv.archivos && rMv.archivos.length) idDriveFinal = rMv.archivos[0].id;
+    else if (!rMv.ok) warning = 'PDF no movido: ' + (rMv.error || 'sin detalle');
+  } else {
+    const nombreEst = _construirNombreArchivoEstandar(campos, fantasma);
+    try {
+      const cur = file.getName();
+      if (cur !== nombreEst && cur.indexOf('[') !== 0) file.setName(nombreEst);
+    } catch (e) { }
+    idDriveFinal = file.getId();
+  }
+
+  const datos = {
+    numero: numFactura, codigo: centroFinal.codigo, cliente: centroFinal.cliente,
+    periodo: campos.fPeriodo, tipo: tipo,
+    fecha: fechaRecep,
+    fechaConsumo: aplicaConsumo ? fechaRecep : '',
+    fechaPeaje:   aplicaPeaje   ? fechaRecep : '',
+    fechaEmision: campos.fEmision || '',
+    fechaVencimiento: campos.fVencimiento || '',
+    kwh: campos.fKwh || 0, sum: campos.fSum || 0, peaje: campos.fPeaje || 0,
+    intereses: campos.fInt || 0, intPeaje: campos.fIntPeaje || 0,
+    total: campos.fTotal || 0,
+    pdfDriveUrl: idDriveFinal || '',
+    procesadoMasivo: true
+  };
+
+  try { agregarFacturaFront(datos); }
+  catch (e) { return { estado: 'error_otro', detalle: 'Al guardar: ' + e.message, numeroFactura: numFactura }; }
+
+  return {
+    estado: esReal ? 'ok' : 'sin_centro',
+    numeroFactura: numFactura, centro: centroFinal.cliente, warnings: warning,
+    nuevaFactura: { numero: numFactura, cliente: centroFinal.cliente, periodo: campos.fPeriodo, tipo: tipo }
+  };
+}
+
+function _cascadaOCRTransicion(base64, mime, nombreArchivo) {
+  let mejor = null, mejorScore = -1, mejorFuente = '';
+  const _try = (fuente, campos) => {
+    if (!campos) return;
+    const score = _contarCamposDetectadosBack(campos).total;
+    if (score > mejorScore) { mejorScore = score; mejor = campos; mejorFuente = fuente; }
+  };
+
+  if (!_driveOcrEstaBloqueado()) {
+    try {
+      const r1 = _extraerConDriveOCR(nombreArchivo, base64, mime);
+      if (r1.ok && r1.texto) _try('Drive OCR', _parsearFacturaCompleta(r1.texto));
+    } catch (e) { }
+  }
+  try {
+    const r2 = _extraerConOCRSpace(nombreArchivo, base64, mime);
+    if (r2.ok && r2.texto) _try('OCR.space', _parsearFacturaCompleta(r2.texto));
+  } catch (e) { }
+  if (GEMINI_API_KEY && String(GEMINI_API_KEY).trim()) {
+    try {
+      const g = _extraerConGemini(base64, mime, nombreArchivo);
+      if (g.ok && g.campos) _try('Gemini', g.campos);
+    } catch (e) { }
+  }
+
+  if (!mejor) return { ok: false, error: 'Ninguna fuente pudo extraer campos' };
+  return { ok: true, campos: mejor, fuente: mejorFuente };
+}
+
+function _renombrarConPrefijo(file, prefijo) {
+  try {
+    const actual = String(file.getName() || '');
+    if (actual.indexOf(prefijo) === 0) return;
+    file.setName(prefijo + ' ' + actual);
+  } catch (e) { Logger.log('_renombrarConPrefijo: ' + e.message); }
+}
+
+function _resumenTransicionUI(r) {
+  const l = [];
+  l.push('📥 Procesamiento de la carpeta de transición');
+  l.push('');
+  l.push('PDFs en carpeta:      ' + r.total);
+  l.push('Procesados:           ' + r.procesados);
+  l.push('Saltados (ya OK):     ' + r.saltados);
+  l.push('');
+  l.push('  ✓ Nuevas movidas:    ' + r.okNuevas);
+  l.push('  · Sin centro:        ' + r.sinCentro);
+  l.push('  · Rectificadas:      ' + r.rectificadas);
+  l.push('  · Duplicadas:        ' + r.duplicadas);
+  l.push('  · Rev. manual diffs: ' + r.revManual);
+  l.push('  · Rev. manual PDF:   ' + r.revisionManual);
+  l.push('  · Errores:           ' + r.errores);
+  if (r.tiempoAgotado) {
+    l.push('');
+    l.push('⏸ Restantes para la próxima ejecución: ' + r.restantes);
+  }
+  return l.join('\n');
+}
+
+function _enviarCorreoTransicion(r) {
+  const l = [];
+  l.push('📥 Procesamiento carpeta de transición · ' + new Date().toLocaleString('es-CL'));
+  l.push('');
+  l.push('PDFs en carpeta:     ' + r.total);
+  l.push('Procesados:          ' + r.procesados);
+  l.push('Saltados (ya OK):    ' + r.saltados);
+  l.push('');
+  l.push('Resultados:');
+  l.push('  ✓ Nuevas (movidas):    ' + r.okNuevas);
+  l.push('  · Sin centro:          ' + r.sinCentro);
+  l.push('  · Rectificadas:        ' + r.rectificadas);
+  l.push('  · Duplicadas:          ' + r.duplicadas);
+  l.push('  · Rev. manual (diffs): ' + r.revManual);
+  l.push('  · Rev. manual PDF:     ' + r.revisionManual);
+  l.push('  · Errores:             ' + r.errores);
+
+  if (r.detalleOk.length) {
+    l.push('');
+    l.push('── NUEVAS / SIN CENTRO ──');
+    r.detalleOk.forEach(d => {
+      l.push('· ' + d.archivo + '  →  N° ' + d.numero + '  ·  ' + (d.centro || '?'));
+      if (d.warnings) l.push('   ⚠ ' + d.warnings);
+    });
+  }
+
+  if (r.detalleRectificadas.length) {
+    l.push('');
+    l.push('── RECTIFICADAS / CAMBIOS ──');
+    r.detalleRectificadas.forEach(d => {
+      l.push('· ' + d.archivo + '  →  N° ' + d.numero);
+      if (d.diffs) {
+        l.push('   Diferencias:');
+        d.diffs.split('\n').forEach(x => l.push('   ' + x));
       }
-      if (motivo.indexOf('PAPELERA') !== -1) papelera++;
-      else inaccesibles++;
-      lineas.push('· Fila ' + (i + 2) + '  N° ' + numero + '  ❌ ' + motivo);
-      lineas.push('    id actual:  ' + pdfId);
-      lineas.push('    auto-búsqueda:  ' + (busqueda.error || 'sin resultado'));
-      return;
-    }
+      if (d.warnings) l.push('   ⚠ ' + d.warnings);
+    });
+  }
 
-    const actual = file.getName();
-    if (actual === nombreNuevo) return;
+  if (r.detalleFallidos.length) {
+    l.push('');
+    l.push('── FALLIDOS (detalle completo) ──');
+    r.detalleFallidos.forEach(d => {
+      l.push('· ' + d.archivo);
+      l.push('   ' + (d.motivo || 'sin detalle'));
+    });
+  }
 
-    conCambio++;
-    lineas.push('· Fila ' + (i + 2) + '  N° ' + numero);
-    lineas.push('    de:  ' + actual);
-    lineas.push('    a:   ' + nombreNuevo);
+  if (r.tiempoAgotado) {
+    l.push('');
+    l.push('⏸ Quedan ' + r.restantes + ' PDFs para la próxima ejecución.');
+  }
+
+  MailApp.sendEmail({
+    to: CORREO_TRANSICION,
+    subject: '📥 Transición · ' + r.procesados + ' procesadas (' +
+      r.okNuevas + ' ok, ' + r.errores + ' errores)',
+    body: l.join('\n')
   });
-
-  const cab = [
-    '🔍 Previsualización de renombrado',
-    '',
-    '· A renombrar:             ' + conCambio,
-    '· Auto-recuperables:       ' + recuperables + '  (en papelera pero encontrados)',
-    '· En papelera (sin match): ' + papelera,
-    '· Inaccesibles:            ' + inaccesibles,
-    ''
-  ].join('\n');
-
-  Logger.log(cab + lineas.join('\n'));
 }
